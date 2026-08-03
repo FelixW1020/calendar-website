@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { createJSONStorage, persist } from 'zustand/middleware';
 import type { Calendar, CalendarEvent, ChatMessage, PendingConfirmation, ViewMode } from './types';
 import { toLocalISO } from './lib/dates';
 
@@ -50,6 +50,59 @@ export function onLocalChange(handler: ((c: LocalChange) => void) | null): void 
 function emit(change: LocalChange): void {
   changeHandler?.(change);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Persistence                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * localStorage.setItem is synchronous and serialises every event in the
+ * calendar. Doing that inside the keystroke that triggered it is a main-thread
+ * stall you can feel while typing, so writes are coalesced onto the next idle
+ * moment instead. Reads stay synchronous — rehydration happens once, before
+ * anything is queued.
+ */
+const WRITE_DELAY_MS = 400;
+
+const writeQueue = new Map<string, string>();
+let writeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushWrites(): void {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  for (const [key, value] of writeQueue) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (err) {
+      console.warn('[store] could not persist state', err);
+    }
+  }
+  writeQueue.clear();
+}
+
+if (typeof window !== 'undefined') {
+  // A queued write must survive the tab being closed or backgrounded —
+  // pagehide is the one event iOS Safari reliably delivers.
+  window.addEventListener('pagehide', flushWrites);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushWrites();
+  });
+}
+
+const deferredStorage = {
+  getItem: (name: string) => writeQueue.get(name) ?? localStorage.getItem(name),
+  setItem: (name: string, value: string) => {
+    writeQueue.set(name, value);
+    if (writeTimer) clearTimeout(writeTimer);
+    writeTimer = setTimeout(flushWrites, WRITE_DELAY_MS);
+  },
+  removeItem: (name: string) => {
+    writeQueue.delete(name);
+    localStorage.removeItem(name);
+  },
+};
 
 export type SyncStatus = 'off' | 'signed-out' | 'syncing' | 'live' | 'error';
 
@@ -240,6 +293,7 @@ export const useStore = create<State>()(
     {
       name: 'calendar.state',
       version: 1,
+      storage: createJSONStorage(() => deferredStorage),
       partialize: (s) => ({
         events: s.events,
         calendars: s.calendars,

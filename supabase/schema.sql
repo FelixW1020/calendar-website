@@ -34,6 +34,12 @@ create table if not exists public.events (
   primary key (user_id, id)
 );
 
+-- Coordinates for a location picked from search, so the pin and the map card
+-- follow the event across devices. A hand-typed location leaves these null.
+alter table public.events add column if not exists place_lat   double precision;
+alter table public.events add column if not exists place_lon   double precision;
+alter table public.events add column if not exists place_label text;
+
 create index if not exists events_user_start_idx
   on public.events (user_id, starts_at);
 

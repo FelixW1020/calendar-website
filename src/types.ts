@@ -1,10 +1,24 @@
 export type ViewMode = 'day' | 'week' | 'month';
 
+/**
+ * A geocoded location. `label` is what the user sees and what `location`
+ * carries; the coordinates are what make maps, distance and directions
+ * possible. A location typed by hand (or a meeting link) has no place.
+ */
+export interface Place {
+  lat: number;
+  lon: number;
+  /** The full one-line address, for the map card and directions. */
+  label: string;
+}
+
 export interface CalendarEvent {
   id: string;
   title: string;
   description?: string;
   location?: string;
+  /** Set when the location was picked from a search result. */
+  place?: Place;
   /** ISO 8601, local wall time with offset. */
   start: string;
   end: string;

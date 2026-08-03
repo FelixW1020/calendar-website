@@ -22,9 +22,24 @@ move it, drag its bottom edge to resize. Click an event to edit or delete it.
 **Locations** — every event has a location field, separate from the title. The
 assistant fills it in on its own: "lunch at Blue Bottle" becomes *Lunch* located
 at *Blue Bottle*, "standup in room 302" becomes *Standup* at *Room 302*. It
-keeps addresses verbatim rather than expanding or geocoding them, and never
-invents one. The editor offers **Open in Maps** for a place, or **Join** when the
-location is a meeting link. Locations show on the event chip and are searchable.
+keeps addresses verbatim rather than expanding one, and never invents one.
+Locations show on the event chip and are searchable.
+
+Start typing a place or address and the field suggests real ones, with places
+already in your calendar offered first and instantly. Pick one and the event
+keeps its coordinates: a map of the spot appears under the field, and **Open in
+Maps** and **Directions** go to the exact pin rather than re-guessing from the
+text. Locations set by the assistant, or typed before this existed, get looked
+up once when you open the event — but only when the match is unambiguous, since
+a wrong pin is worse than none, and "Room 302" is not a place. A meeting link is
+recognised as a link and offers **Join** instead.
+
+Lookups use [Photon](https://photon.komoot.io) and
+[Nominatim](https://nominatim.openstreetmap.org), both OpenStreetMap-based and
+keyless — there is nothing to configure and no billing account to attach.
+Results are biased toward the last place you picked, so "Whole Foods" means the
+one near you. Nothing is sent anywhere until you type at least three characters
+into the location field.
 
 **On phones and tablets** — the layout adapts rather than shrinking: the
 calendar list becomes a slide-in drawer, the assistant a full-screen sheet
@@ -76,7 +91,9 @@ open devices. It needs a Supabase project (free tier is plenty):
 1. Create a project at [supabase.com](https://supabase.com).
 2. **SQL Editor → New query**, paste [`supabase/schema.sql`](supabase/schema.sql),
    and run it. That creates the two tables, the row-level security policies, and
-   the realtime publication.
+   the realtime publication. It is safe to re-run, and you need to re-run it if
+   you set sync up before location pins existed — that is what adds the
+   coordinate columns.
 3. **Project Settings → Data API**: copy the Project URL and the `anon` key.
 4. Local dev: `cp .env.example .env.local` and fill both in.
 5. Deployed: add them as repo variables so the build can see them —
@@ -94,8 +111,14 @@ account reading another's calendar. Never publish the `service_role` key.
 **How it reconciles.** On sign-in, local and server state are merged by id, with
 the newer `updated_at` winning. Deletes are tombstones (`deleted_at`) rather
 than row removals, so a deletion on one device isn't undone by another device
-re-uploading its stale copy. After that, every change writes through
-immediately and a realtime subscription keeps other open devices current.
+re-uploading its stale copy. After that, changes write through continuously and
+a realtime subscription keeps other open devices current.
+
+Writes are coalesced per row over a half-second of quiet (and never held longer
+than 2.5s), so dragging an event across the grid sends one upsert instead of
+one per pointer move, and a queued write is flushed if the tab is hidden or
+closed. Your own writes come back over the realtime channel and are recognised
+and dropped, rather than re-applied on top of what you are editing.
 
 **Staying signed in.** Sign in once per device and stay signed in: the session
 is written to `localStorage` and the access token renews in the background
@@ -145,20 +168,29 @@ src/
     assistant.ts     Claude integration — tools, prompt, tool runner, errors
     dates.ts         Range math, local-ISO serialization, formatting
     layout.ts        Overlapping-event column packing
-    smoke.test.ts    Checks for the two files above
+    geocode.ts       Place search, confident-match resolve, map + maps links
+    sync.ts          Supabase merge, write queue, realtime subscription
+    smoke.test.ts    Checks for dates, layout, and geocode links
   components/
-    TimeGrid.tsx     Day + week grid, drag/resize, current-time line
-    MonthView.tsx    Month grid with "+N more"
-    ChatPanel.tsx    Assistant UI and confirmation gate
-    EventEditor.tsx  Event detail / edit dialog
-    Header.tsx       Navigation, search, view switcher, theme
-    Sidebar.tsx      Mini month, calendar list, shortcuts
+    TimeGrid.tsx        Day + week grid, drag/resize, current-time line
+    MonthView.tsx       Month grid with "+N more"
+    ChatPanel.tsx       Assistant UI and confirmation gate
+    EventEditor.tsx     Event detail / edit dialog
+    LocationField.tsx   Location combobox, suggestions, map card
+    Header.tsx          Navigation, search, view switcher, theme
+    Sidebar.tsx         Mini month, calendar list, shortcuts
   store.ts           Zustand state, persisted to localStorage
 ```
 
-`npm run smoke` runs the date and layout checks; `npm run typecheck` and
+`npm run smoke` runs the date, layout and link checks; `npm run typecheck` and
 `npm run build` cover the rest. There is no backend and nothing at build time
 needs a secret.
+
+**Typing stays local.** The editor holds an event in local state while it is
+open and writes through on a 300ms trailing debounce, so a keystroke costs one
+small re-render instead of a grid re-layout, a full `localStorage` rewrite and a
+network upsert. `localStorage` writes are batched behind the same idea, and are
+flushed when the tab is hidden or closed so nothing typed is lost.
 
 Events are stored as ISO 8601 with a local offset (`2026-08-05T13:05:00-05:00`)
 rather than UTC, so wall time survives a round-trip and reads correctly to the

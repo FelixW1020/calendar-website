@@ -9,6 +9,7 @@ import {
   formatEventTime,
   eventsOn,
 } from './dates';
+import { directionsUrl, isMeetingLink, mapEmbedUrl, mapsUrl } from './geocode';
 import type { CalendarEvent } from '../types';
 
 let n = 0;
@@ -135,6 +136,32 @@ console.log('\ndates');
   assert.equal(eventsOn([overnight], new Date(2026, 7, 5)).length, 1);
   assert.equal(eventsOn([overnight], new Date(2026, 7, 6)).length, 0);
   ok('an overnight event appears on both days it touches');
+}
+
+console.log('\ngeocode');
+{
+  assert.equal(isMeetingLink('https://zoom.us/j/123'), true);
+  assert.equal(isMeetingLink('meet.google.com/abc-defg'), true);
+  assert.equal(isMeetingLink('1364 Campus Dr, Durham'), false);
+  assert.equal(isMeetingLink('Room 302'), false);
+  ok('meeting links are told apart from addresses');
+}
+{
+  const place = { lat: 36.0018682, lon: -78.9402861, label: 'Duke Chapel, Durham, NC' };
+  // A pinned location must open at the pin, not at whatever the text re-matches.
+  assert.match(mapsUrl('Duke Chapel', place), /query=36\.0018682%2C-78\.9402861/);
+  assert.match(mapsUrl('Room 302'), /query=Room%20302/);
+  assert.match(directionsUrl('Duke Chapel', place), /destination=36\.0018682/);
+  ok('map links prefer coordinates over text');
+}
+{
+  const place = { lat: 36, lon: -78.9, label: 'x' };
+  const url = new URL(mapEmbedUrl(place));
+  assert.equal(url.searchParams.get('marker'), '36,-78.9');
+  const [west, south, east, north] = url.searchParams.get('bbox')!.split(',').map(Number);
+  assert.ok(west < place.lon && east > place.lon, 'marker sits inside the box horizontally');
+  assert.ok(south < place.lat && north > place.lat, 'marker sits inside the box vertically');
+  ok('the map embed frames its marker');
 }
 
 console.log(`\n${n} checks passed\n`);

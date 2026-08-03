@@ -102,6 +102,24 @@ export function Pin({ className = base }: Props) {
   );
 }
 
+export function Spinner({ className = base }: Props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
+      <circle cx={12} cy={12} r={9} opacity={0.25} />
+      <path d="M21 12a9 9 0 00-9-9" strokeLinecap="round">
+        <animateTransform
+          attributeName="transform"
+          type="rotate"
+          from="0 12 12"
+          to="360 12 12"
+          dur="0.8s"
+          repeatCount="indefinite"
+        />
+      </path>
+    </svg>
+  );
+}
+
 export function Sparkle({ className = base }: Props) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" className={className}>

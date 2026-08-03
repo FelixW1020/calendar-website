@@ -200,8 +200,21 @@ export default function TimeGrid({ days }: Props) {
 
   /* -------------------------------------------------------------- render -- */
 
-  const allDayRows = days.map((d) => eventsOn(shown, d).filter((e) => e.allDay));
-  const hasAllDay = allDayRows.some((r) => r.length > 0);
+  // Laying out every column is the most expensive thing this component does;
+  // a drag or a clock tick must not redo it.
+  const columns = useMemo(
+    () =>
+      days.map((day) => {
+        const onDay = eventsOn(shown, day);
+        return {
+          day,
+          positioned: layoutDay(onDay, day),
+          allDay: onDay.filter((e) => e.allDay),
+        };
+      }),
+    [days, shown],
+  );
+  const hasAllDay = columns.some((c) => c.allDay.length > 0);
   const draggingEvent = draft ? shown.find((e) => e.id === draft.id) ?? null : null;
 
   const renderBlock = (p: PositionedEvent, isDraft: boolean) => {
@@ -292,9 +305,9 @@ export default function TimeGrid({ days }: Props) {
           <div className="w-11 shrink-0 py-1 pr-2 text-right sm:w-14 text-[10px] uppercase tracking-wider text-ink-faint">
             All day
           </div>
-          {days.map((d, i) => (
+          {columns.map(({ day: d, allDay }) => (
             <div key={d.toISOString()} className="min-h-8 flex-1 space-y-0.5 border-l border-line p-0.5">
-              {allDayRows[i].map((ev) => (
+              {allDay.map((ev) => (
                 <button
                   key={ev.id}
                   onClick={() => select(ev.id)}
@@ -336,8 +349,7 @@ export default function TimeGrid({ days }: Props) {
               ))}
             </div>
 
-            {days.map((day) => {
-              const positioned = layoutDay(eventsOn(shown, day), day);
+            {columns.map(({ day, positioned }) => {
               const today = isSameDay(day, now);
 
               // While dragging, the store still holds the original times, so
