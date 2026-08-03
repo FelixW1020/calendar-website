@@ -11,7 +11,17 @@ export const syncConfigured = Boolean(url && anonKey);
 
 export const supabase: SupabaseClient | null = syncConfigured
   ? createClient(url!, anonKey!, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      auth: {
+        // Sign in once per device and stay signed in: the session is written to
+        // localStorage and the access token is renewed in the background before
+        // it expires, so there is nothing to log back into.
+        persistSession: true,
+        autoRefreshToken: true,
+        storage: window.localStorage,
+        storageKey: 'calendar.auth',
+        // The magic link comes back with the session in the URL.
+        detectSessionInUrl: true,
+      },
     })
   : null;
 

@@ -97,6 +97,17 @@ than row removals, so a deletion on one device isn't undone by another device
 re-uploading its stale copy. After that, every change writes through
 immediately and a realtime subscription keeps other open devices current.
 
+**Staying signed in.** Sign in once per device and stay signed in: the session
+is written to `localStorage` and the access token renews in the background
+before it expires, so there is no repeated login. Signing out is scoped to the
+device you do it on, leaving your other devices alone.
+
+Two things end a session anyway, both outside the app's control — clearing site
+data for the origin, and Safari/iOS evicting script-written storage for a site
+you have not opened in about a week. Also leave **Authentication → Sessions**
+in the Supabase dashboard at its defaults; enabling a time-box or inactivity
+timeout there will log you out on a schedule no matter what the client does.
+
 **Known limit:** edits made while offline stay local until the next successful
 write or sign-in, and a delete made offline can be resurrected by another
 device, because the tombstone never reached the server. Fine for one person on

@@ -237,15 +237,29 @@ function subscribe(uid: string): void {
     .subscribe();
 }
 
+/**
+ * Runs on every auth event. The access token is refreshed roughly hourly, and
+ * `INITIAL_SESSION` races the explicit `getSession()` below, so this has to be
+ * idempotent: only a genuine change of user re-merges and re-subscribes.
+ * `userId` is assigned before the first await so a concurrent call bails.
+ */
 async function onSession(session: Session | null): Promise<void> {
+  const nextId = session?.user?.id ?? null;
+
+  if (nextId === userId) {
+    // Same user — a token refresh or a duplicate event. Nothing to redo.
+    if (session?.user) setSync({ email: session.user.email ?? null });
+    return;
+  }
+
+  userId = nextId;
+
   if (session?.user) {
-    userId = session.user.id;
-    useStore.getState().setSync({ email: session.user.email ?? null });
+    setSync({ email: session.user.email ?? null });
     onLocalChange((c) => void push(c));
     await mergeOnSignIn(session.user.id);
     subscribe(session.user.id);
   } else {
-    userId = null;
     onLocalChange(null);
     channel?.unsubscribe();
     channel = null;
@@ -260,10 +274,19 @@ export function initSync(): () => void {
     return () => {};
   }
 
-  void supabase.auth.getSession().then(({ data }) => onSession(data.session));
-  const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+  const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+    // A refresh that cannot be completed is the one case where a signed-in
+    // user silently drops to local-only. Say so instead of failing quietly.
+    if (event === 'TOKEN_REFRESHED' && !session) {
+      setSync({ status: 'error', message: 'Session expired — sign in again to resume syncing.' });
+      return;
+    }
     void onSession(session);
   });
+
+  // Belt and braces: if the stored session is restored before the listener is
+  // attached, this picks it up. onSession dedupes the overlap.
+  void supabase.auth.getSession().then(({ data }) => onSession(data.session));
 
   return () => {
     sub.subscription.unsubscribe();
@@ -281,5 +304,8 @@ export async function signIn(email: string): Promise<void> {
 }
 
 export async function signOut(): Promise<void> {
-  await supabase?.auth.signOut();
+  // Local scope: signing out on this device leaves your other devices signed
+  // in. The default ('global') would revoke every session everywhere, which is
+  // rarely what you want on your own devices.
+  await supabase?.auth.signOut({ scope: 'local' });
 }
