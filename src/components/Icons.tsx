@@ -73,6 +73,23 @@ export function Send({ className = base }: Props) {
   );
 }
 
+export function Menu({ className = base }: Props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
+      <path d="M4 7h16M4 12h16M4 17h16" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function Pin({ className = base }: Props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
+      <path d="M12 21s7-5.5 7-11a7 7 0 10-14 0c0 5.5 7 11 7 11z" strokeLinejoin="round" />
+      <circle cx={12} cy={10} r={2.5} />
+    </svg>
+  );
+}
+
 export function Sparkle({ className = base }: Props) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" className={className}>

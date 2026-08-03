@@ -40,7 +40,7 @@ export default function MonthView({ days, anchorMonth }: Props) {
 
       <div className="flex flex-1 flex-col overflow-y-auto">
         {weeks.map((week, wi) => (
-          <div key={wi} className="flex min-h-28 flex-1 border-b border-line last:border-b-0">
+          <div key={wi} className="flex min-h-20 flex-1 sm:min-h-28 border-b border-line last:border-b-0">
             {week.map((day) => {
               const key = day.toDateString();
               const dayEvents = eventsOn(shown, day).sort((a, b) => {
@@ -131,7 +131,7 @@ function Chip({ event, onSelect }: { event: CalendarEvent; onSelect: () => void 
       className="flex w-full items-center gap-1.5 truncate rounded px-1 py-[2px] text-left text-[11px] hover:bg-black/5 dark:hover:bg-white/5"
     >
       <span className="event-chip h-2 w-2 shrink-0 rounded-full" style={{ background: color }} />
-      <span className="shrink-0 tabular-nums text-ink-faint">
+      <span className="hidden shrink-0 tabular-nums text-ink-faint sm:inline">
         {format(parse(event.start), 'h:mm')}
       </span>
       <span className="truncate text-ink">{event.title}</span>

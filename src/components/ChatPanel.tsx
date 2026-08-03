@@ -3,7 +3,7 @@ import type { ChatMessage } from '../types';
 import { useStore, uid } from '../store';
 import { parse } from '../lib/dates';
 import { AssistantError, resetConversation, sendToAssistant } from '../lib/assistant';
-import { Send, Sparkle } from './Icons';
+import { Close, Send, Sparkle } from './Icons';
 
 const SUGGESTIONS = [
   'Lunch with Priya Thursday at 1',
@@ -15,9 +15,12 @@ const SUGGESTIONS = [
 interface Props {
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
   onOpenSettings: () => void;
+  /** Sheet state, used below the md breakpoint where the panel is an overlay. */
+  open: boolean;
+  onClose: () => void;
 }
 
-export default function ChatPanel({ inputRef, onOpenSettings }: Props) {
+export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: Props) {
   const chat = useStore((s) => s.chat);
   const busy = useStore((s) => s.chatBusy);
   const confirmation = useStore((s) => s.confirmation);
@@ -82,7 +85,16 @@ export default function ChatPanel({ inputRef, onOpenSettings }: Props) {
   };
 
   return (
-    <section className="flex w-full shrink-0 flex-col border-l border-line bg-panel md:w-80 xl:w-96">
+    <section
+      className={
+        'flex shrink-0 flex-col border-line bg-panel ' +
+        // Full-screen sheet below md (the header is two rows tall there, so a
+        // partial sheet would cover the nav); a static column at md and up.
+        'fixed inset-0 z-50 shadow-2xl transition-transform duration-200 ' +
+        (open ? 'translate-y-0' : 'translate-y-full') +
+        ' md:static md:z-auto md:w-80 md:translate-y-0 md:border-l md:shadow-none xl:w-96'
+      }
+    >
       <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-2.5">
         <Sparkle className="h-4 w-4 text-accent" />
         <span className="font-display text-base text-ink">Assistant</span>
@@ -109,6 +121,13 @@ export default function ChatPanel({ inputRef, onOpenSettings }: Props) {
               }
             />
             Key
+          </button>
+          <button
+            onClick={onClose}
+            aria-label="Close assistant"
+            className="rounded p-1 text-ink-faint hover:text-ink md:hidden"
+          >
+            <Close />
           </button>
         </div>
       </div>
@@ -173,7 +192,7 @@ export default function ChatPanel({ inputRef, onOpenSettings }: Props) {
           e.preventDefault();
           void send(text);
         }}
-        className="shrink-0 border-t border-line p-2"
+        className="shrink-0 border-t border-line p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:pb-2"
       >
         <div className="flex items-end gap-2 rounded-lg border border-line bg-canvas p-1.5 focus-within:border-line-strong">
           <textarea

@@ -6,6 +6,7 @@ import MonthView from './components/MonthView';
 import EventEditor from './components/EventEditor';
 import ChatPanel from './components/ChatPanel';
 import ApiKeyDialog from './components/ApiKeyDialog';
+import { Sparkle } from './components/Icons';
 import { useStore } from './store';
 import { daysIn, step, visibleRange } from './lib/dates';
 
@@ -35,6 +36,8 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null);
   const chatRef = useRef<HTMLTextAreaElement>(null);
   const [keyDialog, setKeyDialog] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
 
   // Keep the DOM class in sync with the persisted theme (the inline script in
   // index.html handles the very first paint).
@@ -50,8 +53,21 @@ export default function App() {
     }
   }, [apiKey]);
 
+  // Close the drawer when the viewport grows past the breakpoint that hides it,
+  // otherwise it lingers as an invisible focus trap.
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const sync = () => mq.matches && setMenuOpen(false);
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMenuOpen(false);
+        setChatOpen(false);
+      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTyping(e.target)) return;
 
@@ -78,6 +94,7 @@ export default function App() {
           break;
         case 'c':
           e.preventDefault();
+          setChatOpen(true);
           chatRef.current?.focus();
           break;
         case '/':
@@ -94,10 +111,10 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-canvas">
-      <Header searchRef={searchRef} />
+      <Header searchRef={searchRef} onOpenMenu={() => setMenuOpen(true)} />
 
       <div className="flex min-h-0 flex-1">
-        <Sidebar />
+        <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
 
         <main className="min-w-0 flex-1 overflow-hidden">
           {view === 'month' ? (
@@ -107,8 +124,27 @@ export default function App() {
           )}
         </main>
 
-        <ChatPanel inputRef={chatRef} onOpenSettings={() => setKeyDialog(true)} />
+        <ChatPanel
+          inputRef={chatRef}
+          onOpenSettings={() => setKeyDialog(true)}
+          open={chatOpen}
+          onClose={() => setChatOpen(false)}
+        />
       </div>
+
+      {/* Opens the assistant sheet on phones, where the panel is off-screen. */}
+      {!chatOpen && (
+        <button
+          onClick={() => {
+            setChatOpen(true);
+            setTimeout(() => chatRef.current?.focus(), 220);
+          }}
+          aria-label="Open assistant"
+          className="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] right-4 z-30 flex h-14 w-14 items-center justify-center rounded-full bg-accent text-white shadow-lg transition active:scale-95 md:hidden"
+        >
+          <Sparkle className="h-5 w-5" />
+        </button>
+      )}
 
       {selectedEventId && <EventEditor />}
       {keyDialog && <ApiKeyDialog onClose={() => setKeyDialog(false)} />}

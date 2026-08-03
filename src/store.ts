@@ -76,7 +76,8 @@ export const useStore = create<State>()(
       apiKey: null,
       theme: 'light',
 
-      view: 'week',
+      // A 7-column week is unreadable on a phone; start those users on day view.
+      view: typeof window !== 'undefined' && window.innerWidth < 640 ? 'day' : 'week',
       anchor: toLocalISO(new Date()),
       selectedEventId: null,
       chat: [],

@@ -9,6 +9,11 @@ function toInput(iso: string, dateOnly = false): string {
   return dateOnly ? format(d, 'yyyy-MM-dd') : format(d, "yyyy-MM-dd'T'HH:mm");
 }
 
+/** A meeting link should offer "Join", not a map lookup. */
+function isLink(value: string): boolean {
+  return /^(https?:\/\/|www\.)|\.(zoom\.us|meet\.google\.com|teams\.microsoft\.com)/i.test(value.trim());
+}
+
 function fromInput(value: string, endOfDay = false): string {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     const [y, m, d] = value.split('-').map(Number);
@@ -127,11 +132,33 @@ export default function EventEditor() {
           </div>
 
           <div>
-            <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Location</div>
+            <div className="mb-1 flex items-baseline justify-between">
+              <span className="text-[11px] uppercase tracking-wider text-ink-faint">Location</span>
+              {event.location?.trim() && !isLink(event.location) && (
+                <a
+                  href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(event.location)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
+                >
+                  Open in Maps
+                </a>
+              )}
+              {event.location && isLink(event.location) && (
+                <a
+                  href={event.location.startsWith('http') ? event.location : `https://${event.location}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
+                >
+                  Join
+                </a>
+              )}
+            </div>
             <input
               value={event.location ?? ''}
               onChange={(e) => set({ location: e.target.value })}
-              placeholder="Optional"
+              placeholder="Place, address, or meeting link"
               className={field}
             />
           </div>

@@ -10,7 +10,13 @@ import {
 } from '../lib/dates';
 import { ChevronLeft, ChevronRight } from './Icons';
 
-export default function Sidebar() {
+interface Props {
+  /** Drawer state, used below the lg breakpoint where the sidebar is off-canvas. */
+  open: boolean;
+  onClose: () => void;
+}
+
+export default function Sidebar({ open, onClose }: Props) {
   const anchor = new Date(useStore((s) => s.anchor));
   const view = useStore((s) => s.view);
   const setAnchor = useStore((s) => s.setAnchor);
@@ -38,7 +44,23 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="hidden w-56 shrink-0 flex-col gap-5 overflow-y-auto border-r border-line p-3 lg:flex">
+    <>
+      {/* Scrim, drawer mode only. */}
+      {open && (
+        <div
+          onClick={onClose}
+          className="fixed inset-0 z-40 bg-black/30 lg:hidden dark:bg-black/60"
+        />
+      )}
+      <aside
+        className={
+          'flex w-56 shrink-0 flex-col gap-5 overflow-y-auto border-r border-line bg-panel p-3 ' +
+          // Off-canvas drawer below lg, static column at lg and up.
+          'fixed inset-y-0 left-0 z-50 transition-transform duration-200 ' +
+          (open ? 'translate-x-0' : '-translate-x-full') +
+          ' lg:static lg:z-auto lg:translate-x-0 lg:bg-transparent'
+        }
+      >
       {/* Mini month */}
       <div>
         <div className="mb-1 flex items-center justify-between">
@@ -154,12 +176,14 @@ export default function Sidebar() {
         )}
       </div>
 
-      <div className="mt-auto space-y-1 pt-4 text-[11px] leading-relaxed text-ink-faint">
+      {/* Keyboard hints are noise on a touch device. */}
+      <div className="mt-auto hidden space-y-1 pt-4 text-[11px] leading-relaxed text-ink-faint lg:block">
         <div className="font-medium uppercase tracking-wider">Shortcuts</div>
         <div><kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> switch view</div>
         <div><kbd>T</kbd> today · <kbd>J</kbd>/<kbd>K</kbd> prev/next</div>
         <div><kbd>C</kbd> chat · <kbd>/</kbd> search</div>
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }

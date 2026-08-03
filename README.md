@@ -19,6 +19,20 @@ into the dialog on first load, or click **Key** in the assistant panel.
 **Views** — day, week, month. Click an empty slot to create an event, drag to
 move it, drag its bottom edge to resize. Click an event to edit or delete it.
 
+**Locations** — every event has a location field, separate from the title. The
+assistant fills it in on its own: "lunch at Blue Bottle" becomes *Lunch* located
+at *Blue Bottle*, "standup in room 302" becomes *Standup* at *Room 302*. It
+keeps addresses verbatim rather than expanding or geocoding them, and never
+invents one. The editor offers **Open in Maps** for a place, or **Join** when the
+location is a meeting link. Locations show on the event chip and are searchable.
+
+**On phones and tablets** — the layout adapts rather than shrinking: the
+calendar list becomes a slide-in drawer, the assistant a full-screen sheet
+behind a button in the corner, and the header splits into two rows. Phones open
+on day view, since a 7-column week is unreadable at that width. Tap an empty
+slot to create, tap an event to edit. Drag-to-move is pointer-only — on touch a
+press has to stay available for scrolling.
+
 **Shortcuts**
 
 | Key | Does |

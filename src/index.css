@@ -45,6 +45,37 @@ body {
   color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+  /* Stop iOS Safari from zooming the whole page on an input focus, and from
+     rubber-banding the document behind the fixed app shell. */
+  overscroll-behavior: none;
+}
+
+/* iOS reports 100% of the *largest* viewport, which leaves the layout under
+   the browser chrome. dvh tracks the visible area as the toolbars collapse. */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+}
+
+/* Anything below 16px triggers iOS's focus zoom; keep form controls at 16px on
+   touch layouts and let the sm breakpoint shrink them back. */
+@media (max-width: 640px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+/* Comfortable tap targets on touch without inflating the desktop UI. */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  [role='button'] {
+    touch-action: manipulation;
+  }
 }
 
 /* Event chips are saturated mid-tones tuned for white text on light

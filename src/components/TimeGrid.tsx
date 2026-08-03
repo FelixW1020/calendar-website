@@ -82,7 +82,7 @@ export default function TimeGrid({ days }: Props) {
     if (el && el.scrollTop === 0) el.scrollTop = 7.5 * HOUR_HEIGHT;
   }, []);
 
-  const pointerToSlot = (e: PointerEvent | React.PointerEvent) => {
+  const pointerToSlot = (e: { clientX: number; clientY: number }) => {
     const el = gridRef.current;
     if (!el) return null;
     const rect = el.getBoundingClientRect();
@@ -145,6 +145,9 @@ export default function TimeGrid({ days }: Props) {
 
   const beginMove = (e: React.PointerEvent, ev: CalendarEvent) => {
     if (ev.allDay || e.button !== 0) return;
+    // On touch, a press on an event has to stay available for scrolling the
+    // grid. Tap opens the editor instead; drag is a pointer-device gesture.
+    if (e.pointerType === 'touch') return;
     e.stopPropagation();
     const slot = pointerToSlot(e);
     if (!slot) return;
@@ -160,7 +163,7 @@ export default function TimeGrid({ days }: Props) {
   };
 
   const beginResize = (e: React.PointerEvent, ev: CalendarEvent, day: Date) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || e.pointerType === 'touch') return;
     e.stopPropagation();
     movedRef.current = false;
     setDrag({
@@ -175,7 +178,9 @@ export default function TimeGrid({ days }: Props) {
 
   /* -------------------------------------------------------------- create -- */
 
-  const createAt = (e: React.PointerEvent, day: Date) => {
+  // Fired on click rather than pointerdown: a touch that turns into a scroll
+  // never produces a click, so scrolling no longer creates stray events.
+  const createAt = (e: React.MouseEvent, day: Date) => {
     if (e.button !== 0) return;
     const slot = pointerToSlot(e);
     if (!slot) return;
@@ -260,7 +265,7 @@ export default function TimeGrid({ days }: Props) {
     <div className="flex h-full flex-col">
       {/* Day headers */}
       <div className="flex shrink-0 border-b border-line pr-[10px]">
-        <div className="w-14 shrink-0" />
+        <div className="w-11 shrink-0 sm:w-14" />
         {days.map((d) => {
           const today = isSameDay(d, now);
           return (
@@ -284,7 +289,7 @@ export default function TimeGrid({ days }: Props) {
       {/* All-day strip */}
       {hasAllDay && (
         <div className="flex shrink-0 border-b border-line pr-[10px]">
-          <div className="w-14 shrink-0 py-1 pr-2 text-right text-[10px] uppercase tracking-wider text-ink-faint">
+          <div className="w-11 shrink-0 py-1 pr-2 text-right sm:w-14 text-[10px] uppercase tracking-wider text-ink-faint">
             All day
           </div>
           {days.map((d, i) => (
@@ -308,7 +313,7 @@ export default function TimeGrid({ days }: Props) {
       <div ref={scrollRef} className="relative flex-1 overflow-y-auto">
         <div className="flex">
           {/* Hour gutter */}
-          <div className="w-14 shrink-0">
+          <div className="w-11 shrink-0 sm:w-14">
             {HOURS.map((h) => (
               <div key={h} style={{ height: HOUR_HEIGHT }} className="relative">
                 <span className="absolute -top-2 right-2 text-[11px] tabular-nums text-ink-faint">
@@ -357,7 +362,7 @@ export default function TimeGrid({ days }: Props) {
               return (
                 <div
                   key={day.toISOString()}
-                  onPointerDown={(e) => {
+                  onClick={(e) => {
                     if (e.target === e.currentTarget) createAt(e, day);
                   }}
                   className="relative flex-1 border-l border-line"
