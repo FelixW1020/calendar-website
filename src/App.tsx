@@ -6,8 +6,10 @@ import MonthView from './components/MonthView';
 import EventEditor from './components/EventEditor';
 import ChatPanel from './components/ChatPanel';
 import ApiKeyDialog from './components/ApiKeyDialog';
+import AccountDialog from './components/AccountDialog';
 import { Sparkle } from './components/Icons';
 import { useStore } from './store';
+import { initSync } from './lib/sync';
 import { daysIn, step, visibleRange } from './lib/dates';
 
 function isTyping(target: EventTarget | null): boolean {
@@ -38,6 +40,11 @@ export default function App() {
   const [keyDialog, setKeyDialog] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+
+  // Restores the session, merges with the server, and starts realtime.
+  // A no-op build without Supabase credentials stays local-only.
+  useEffect(() => initSync(), []);
 
   // Keep the DOM class in sync with the persisted theme (the inline script in
   // index.html handles the very first paint).
@@ -111,7 +118,11 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-canvas">
-      <Header searchRef={searchRef} onOpenMenu={() => setMenuOpen(true)} />
+      <Header
+        searchRef={searchRef}
+        onOpenMenu={() => setMenuOpen(true)}
+        onOpenAccount={() => setAccountOpen(true)}
+      />
 
       <div className="flex min-h-0 flex-1">
         <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
@@ -148,6 +159,7 @@ export default function App() {
 
       {selectedEventId && <EventEditor />}
       {keyDialog && <ApiKeyDialog onClose={() => setKeyDialog(false)} />}
+      {accountOpen && <AccountDialog onClose={() => setAccountOpen(false)} />}
     </div>
   );
 }

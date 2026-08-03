@@ -1,0 +1,285 @@
+import type { RealtimeChannel, Session } from '@supabase/supabase-js';
+import type { Calendar, CalendarEvent } from '../types';
+import { onLocalChange, useStore, type LocalChange, type SyncState } from '../store';
+import { supabase, syncConfigured, type CalendarRow, type EventRow } from './supabase';
+import { parse, toLocalISO } from './dates';
+
+/* -------------------------------------------------------------------------- */
+/* Row <-> model                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Stored as timestamptz (an instant), rendered back in whatever timezone the
+ * device is in. That is the right call for syncing across devices, and it is
+ * why the client keeps local-offset ISO rather than bare wall time.
+ */
+function rowToEvent(r: EventRow): CalendarEvent {
+  return {
+    id: r.id,
+    title: r.title,
+    description: r.description ?? undefined,
+    location: r.location ?? undefined,
+    start: toLocalISO(new Date(r.starts_at)),
+    end: toLocalISO(new Date(r.ends_at)),
+    allDay: r.all_day,
+    calendarId: r.calendar_id,
+    recurrence: r.recurrence ?? undefined,
+    createdAt: toLocalISO(new Date(r.created_at)),
+    updatedAt: toLocalISO(new Date(r.updated_at)),
+  };
+}
+
+function eventToRow(e: CalendarEvent, userId: string) {
+  return {
+    id: e.id,
+    user_id: userId,
+    calendar_id: e.calendarId,
+    title: e.title,
+    description: e.description ?? null,
+    location: e.location ?? null,
+    starts_at: parse(e.start).toISOString(),
+    ends_at: parse(e.end).toISOString(),
+    all_day: e.allDay,
+    recurrence: e.recurrence ?? null,
+    created_at: parse(e.createdAt).toISOString(),
+    updated_at: parse(e.updatedAt).toISOString(),
+    deleted_at: null,
+  };
+}
+
+function rowToCalendar(r: CalendarRow): Calendar {
+  return { id: r.id, name: r.name, color: r.color, visible: r.visible };
+}
+
+function calendarToRow(c: Calendar, userId: string) {
+  return {
+    id: c.id,
+    user_id: userId,
+    name: c.name,
+    color: c.color,
+    visible: c.visible,
+    updated_at: new Date().toISOString(),
+    deleted_at: null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Engine                                                                     */
+/* -------------------------------------------------------------------------- */
+
+let channel: RealtimeChannel | null = null;
+let userId: string | null = null;
+
+const setSync = (patch: Partial<SyncState>) => useStore.getState().setSync(patch);
+
+function fail(where: string, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[sync] ${where}:`, error);
+  setSync({ status: 'error', message: `${where}: ${message}` });
+}
+
+/**
+ * Pull everything, reconcile against what is on this device, then push back
+ * whatever the server is missing or has an older copy of.
+ *
+ * Reconciliation is last-write-wins on `updated_at`, with tombstones counted as
+ * writes — so a delete on one device beats an older edit on another.
+ */
+async function mergeOnSignIn(uid: string): Promise<void> {
+  if (!supabase) return;
+  setSync({ status: 'syncing', message: null });
+
+  const [{ data: eventRows, error: eErr }, { data: calRows, error: cErr }] = await Promise.all([
+    supabase.from('events').select('*').eq('user_id', uid),
+    supabase.from('calendars').select('*').eq('user_id', uid),
+  ]);
+  if (eErr) return fail('loading events', eErr);
+  if (cErr) return fail('loading calendars', cErr);
+
+  const local = useStore.getState();
+  const localEvents = new Map(local.events.map((e) => [e.id, e]));
+  const localCals = new Map(local.calendars.map((c) => [c.id, c]));
+
+  const mergedEvents = new Map(localEvents);
+  const toPushEvents: CalendarEvent[] = [];
+
+  for (const row of (eventRows ?? []) as EventRow[]) {
+    const mine = localEvents.get(row.id);
+    if (row.deleted_at) {
+      // Server says deleted. Keep it only if this device edited it afterwards.
+      if (mine && parse(mine.updatedAt) > new Date(row.deleted_at)) {
+        toPushEvents.push(mine);
+      } else {
+        mergedEvents.delete(row.id);
+      }
+      continue;
+    }
+    const theirs = rowToEvent(row);
+    if (!mine || parse(theirs.updatedAt) >= parse(mine.updatedAt)) {
+      mergedEvents.set(row.id, theirs);
+    } else {
+      toPushEvents.push(mine);
+    }
+  }
+  // Anything this device has that the server has never seen.
+  const seen = new Set((eventRows ?? []).map((r) => (r as EventRow).id));
+  for (const e of local.events) if (!seen.has(e.id)) toPushEvents.push(e);
+
+  const mergedCals = new Map(localCals);
+  const toPushCals: Calendar[] = [];
+  for (const row of (calRows ?? []) as CalendarRow[]) {
+    if (row.deleted_at) {
+      mergedCals.delete(row.id);
+      continue;
+    }
+    mergedCals.set(row.id, rowToCalendar(row));
+  }
+  const seenCals = new Set((calRows ?? []).map((r) => (r as CalendarRow).id));
+  for (const c of local.calendars) if (!seenCals.has(c.id)) toPushCals.push(c);
+
+  // A calendar must exist before events can reference it.
+  if (toPushCals.length > 0) {
+    const { error } = await supabase
+      .from('calendars')
+      .upsert(toPushCals.map((c) => calendarToRow(c, uid)));
+    if (error) return fail('uploading calendars', error);
+  }
+  if (toPushEvents.length > 0) {
+    const { error } = await supabase
+      .from('events')
+      .upsert(toPushEvents.map((e) => eventToRow(e, uid)));
+    if (error) return fail('uploading events', error);
+  }
+
+  useStore.getState().replaceAll([...mergedEvents.values()], [...mergedCals.values()]);
+  setSync({ status: 'live', message: null });
+}
+
+/** Write a single local change straight through to the server. */
+async function push(change: LocalChange): Promise<void> {
+  if (!supabase || !userId) return;
+  const uid = userId;
+  try {
+    switch (change.kind) {
+      case 'event.upsert': {
+        const { error } = await supabase.from('events').upsert(eventToRow(change.event, uid));
+        if (error) throw error;
+        break;
+      }
+      case 'event.delete': {
+        // Tombstone rather than delete, so other devices learn about it.
+        const { error } = await supabase
+          .from('events')
+          .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('user_id', uid)
+          .eq('id', change.id);
+        if (error) throw error;
+        break;
+      }
+      case 'calendar.upsert': {
+        const { error } = await supabase.from('calendars').upsert(calendarToRow(change.calendar, uid));
+        if (error) throw error;
+        break;
+      }
+      case 'calendar.delete': {
+        const { error } = await supabase
+          .from('calendars')
+          .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('user_id', uid)
+          .eq('id', change.id);
+        if (error) throw error;
+        break;
+      }
+    }
+    const { status } = useStore.getState().sync;
+    if (status === 'error') setSync({ status: 'live', message: null });
+  } catch (err) {
+    fail('saving', err);
+  }
+}
+
+/** Live updates from this user's other devices. */
+function subscribe(uid: string): void {
+  if (!supabase) return;
+  channel?.unsubscribe();
+  channel = supabase
+    .channel('calendar-sync')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'events', filter: `user_id=eq.${uid}` },
+      (payload) => {
+        const row = payload.new as EventRow | null;
+        if (!row?.id) return;
+        useStore
+          .getState()
+          .applyRemote(
+            row.deleted_at
+              ? { kind: 'event.delete', id: row.id }
+              : { kind: 'event.upsert', event: rowToEvent(row) },
+          );
+      },
+    )
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'calendars', filter: `user_id=eq.${uid}` },
+      (payload) => {
+        const row = payload.new as CalendarRow | null;
+        if (!row?.id) return;
+        useStore
+          .getState()
+          .applyRemote(
+            row.deleted_at
+              ? { kind: 'calendar.delete', id: row.id }
+              : { kind: 'calendar.upsert', calendar: rowToCalendar(row) },
+          );
+      },
+    )
+    .subscribe();
+}
+
+async function onSession(session: Session | null): Promise<void> {
+  if (session?.user) {
+    userId = session.user.id;
+    useStore.getState().setSync({ email: session.user.email ?? null });
+    onLocalChange((c) => void push(c));
+    await mergeOnSignIn(session.user.id);
+    subscribe(session.user.id);
+  } else {
+    userId = null;
+    onLocalChange(null);
+    channel?.unsubscribe();
+    channel = null;
+    setSync({ status: 'signed-out', email: null, message: null });
+  }
+}
+
+/** Called once at startup. No-op when Supabase is not configured. */
+export function initSync(): () => void {
+  if (!syncConfigured || !supabase) {
+    useStore.getState().setSync({ status: 'off', email: null, message: null });
+    return () => {};
+  }
+
+  void supabase.auth.getSession().then(({ data }) => onSession(data.session));
+  const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    void onSession(session);
+  });
+
+  return () => {
+    sub.subscription.unsubscribe();
+    channel?.unsubscribe();
+  };
+}
+
+export async function signIn(email: string): Promise<void> {
+  if (!supabase) throw new Error('Sync is not configured.');
+  const { error } = await supabase.auth.signInWithOtp({
+    email,
+    options: { emailRedirectTo: window.location.href },
+  });
+  if (error) throw error;
+}
+
+export async function signOut(): Promise<void> {
+  await supabase?.auth.signOut();
+}

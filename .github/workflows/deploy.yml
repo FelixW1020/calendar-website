@@ -34,7 +34,13 @@ jobs:
           npm run typecheck
           npm run smoke
 
+      # Vite inlines VITE_* at build time, so these must be present here.
+      # Repo variables are fine: the anon key is public by design and RLS is
+      # what protects the data. Secrets work too, hence the fallback.
       - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY }}
 
       - uses: actions/configure-pages@v5
 

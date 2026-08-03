@@ -14,7 +14,9 @@
   --color-ink: #24211c;
   --color-ink-soft: #6b655b;
   --color-ink-faint: #9a9388;
-  --color-accent: #b0542c;
+  /* Taken from the favicon so the tab icon and the UI read as one mark. */
+  --color-accent: #2a55f7;
+  --color-accent-deep: #122b8f;
 }
 
 :root {
@@ -30,7 +32,10 @@
   --color-ink: #e8e6e1;
   --color-ink-soft: #9aa0a8;
   --color-ink-faint: #6b7480;
-  --color-accent: #e0855c;
+  /* Lifted off the icon blue so it stands out on the dark canvas, but kept
+     dark enough that the white text sitting on it stays legible. */
+  --color-accent: #5b7cfa;
+  --color-accent-deep: #8fa6ff;
 }
 
 html,

@@ -73,6 +73,18 @@ export function Send({ className = base }: Props) {
   );
 }
 
+export function Cloud({ className = base }: Props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
+      <path
+        d="M7 18a4 4 0 01-.5-7.97 5.5 5.5 0 0110.6-1.5A3.75 3.75 0 0117.5 18z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function Menu({ className = base }: Props) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>

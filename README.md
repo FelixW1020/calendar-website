@@ -64,6 +64,46 @@ happen.
 
 ---
 
+## Sync across devices
+
+Without setup, the calendar is saved in `localStorage`: it survives reloads on
+that one browser, but your phone and your laptop keep **separate** calendars,
+and clearing site data erases it.
+
+Turning on sync gives you one calendar everywhere, with live updates between
+open devices. It needs a Supabase project (free tier is plenty):
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. **SQL Editor → New query**, paste [`supabase/schema.sql`](supabase/schema.sql),
+   and run it. That creates the two tables, the row-level security policies, and
+   the realtime publication.
+3. **Project Settings → Data API**: copy the Project URL and the `anon` key.
+4. Local dev: `cp .env.example .env.local` and fill both in.
+5. Deployed: add them as repo variables so the build can see them —
+   ```bash
+   gh variable set SUPABASE_URL      --body "https://your-project.supabase.co"
+   gh variable set SUPABASE_ANON_KEY --body "your-anon-key"
+   ```
+   then re-run the deploy (`gh workflow run "Deploy to GitHub Pages"`).
+6. Open the site, click the cloud icon in the header, and sign in with your
+   email. Supabase sends a link — no password.
+
+The `anon` key is meant to be public; row-level security is what stops one
+account reading another's calendar. Never publish the `service_role` key.
+
+**How it reconciles.** On sign-in, local and server state are merged by id, with
+the newer `updated_at` winning. Deletes are tombstones (`deleted_at`) rather
+than row removals, so a deletion on one device isn't undone by another device
+re-uploading its stale copy. After that, every change writes through
+immediately and a realtime subscription keeps other open devices current.
+
+**Known limit:** edits made while offline stay local until the next successful
+write or sign-in, and a delete made offline can be resurrected by another
+device, because the tombstone never reached the server. Fine for one person on
+a few devices; it is not a full offline-first CRDT.
+
+---
+
 ## Where the key lives
 
 The key is stored in this browser's `localStorage` and requests go straight from

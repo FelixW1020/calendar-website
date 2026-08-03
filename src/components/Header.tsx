@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import type { ViewMode } from '../types';
 import { calendarColor, useStore, visibleEvents } from '../store';
 import { format, parse, rangeLabel, step } from '../lib/dates';
-import { ChevronLeft, ChevronRight, Menu, Moon, Search, Sun } from './Icons';
+import { ChevronLeft, ChevronRight, Cloud, Menu, Moon, Search, Sun } from './Icons';
 
 const VIEWS: { id: ViewMode; label: string; short: string }[] = [
   { id: 'day', label: 'Day', short: 'D' },
@@ -13,9 +13,19 @@ const VIEWS: { id: ViewMode; label: string; short: string }[] = [
 interface Props {
   searchRef: React.RefObject<HTMLInputElement | null>;
   onOpenMenu: () => void;
+  onOpenAccount: () => void;
 }
 
-export default function Header({ searchRef, onOpenMenu }: Props) {
+const SYNC_LABEL: Record<string, string> = {
+  off: 'Saved on this device only',
+  'signed-out': 'Not syncing — sign in to use this calendar on other devices',
+  syncing: 'Syncing…',
+  live: 'Synced',
+  error: 'Sync problem — click for details',
+};
+
+export default function Header({ searchRef, onOpenMenu, onOpenAccount }: Props) {
+  const sync = useStore((s) => s.sync);
   const view = useStore((s) => s.view);
   const setView = useStore((s) => s.setView);
   const anchorISO = useStore((s) => s.anchor);
@@ -152,6 +162,27 @@ export default function Header({ searchRef, onOpenMenu }: Props) {
         <div className="hidden sm:block">
           <Views />
         </div>
+
+        <button
+          onClick={onOpenAccount}
+          aria-label={SYNC_LABEL[sync.status] ?? 'Sync'}
+          title={SYNC_LABEL[sync.status] ?? 'Sync'}
+          className={iconBtn + ' relative'}
+        >
+          <Cloud />
+          <span
+            className={
+              'absolute right-1 top-1 h-1.5 w-1.5 rounded-full ring-2 ring-canvas ' +
+              (sync.status === 'live'
+                ? 'bg-emerald-500'
+                : sync.status === 'syncing'
+                  ? 'bg-amber-500'
+                  : sync.status === 'error'
+                    ? 'bg-red-500'
+                    : 'bg-ink-faint')
+            }
+          />
+        </button>
 
         <button onClick={toggleTheme} aria-label="Toggle theme" className={iconBtn}>
           {theme === 'dark' ? <Sun /> : <Moon />}
