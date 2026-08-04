@@ -39,10 +39,24 @@ export interface Calendar {
 
 export type ChatRole = 'user' | 'assistant';
 
+export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
+/** A photo attached to a message, held as the base64 payload the API takes. */
+export interface ChatImage {
+  id: string;
+  /** Original file name, kept for the tooltip and for what we tell the model. */
+  name: string;
+  mediaType: ImageMediaType;
+  /** Base64 bytes with no `data:` prefix. */
+  data: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   text: string;
+  /** Photos the user sent with this message. */
+  images?: ChatImage[];
   /** Human-readable log of tool calls made during this turn. */
   actions?: string[];
   error?: boolean;

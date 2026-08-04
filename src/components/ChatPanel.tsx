@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ChatMessage } from '../types';
+import type { ChatImage, ChatMessage } from '../types';
 import { useStore, uid } from '../store';
 import { parse } from '../lib/dates';
 import { AssistantError, resetConversation, sendToAssistant } from '../lib/assistant';
-import { Close, Send, Sparkle } from './Icons';
+import { MAX_IMAGES, dataUrl, isImageFile, readImage } from '../lib/images';
+import { Close, Photo, Send, Sparkle } from './Icons';
 
 const SUGGESTIONS = [
   'Lunch with Priya Thursday at 1',
@@ -29,20 +30,55 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
   const setApiKey = useStore((s) => s.setApiKey);
 
   const [text, setText] = useState('');
+  const [photos, setPhotos] = useState<ChatImage[]>([]);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
-  }, [chat, busy, confirmation]);
+  }, [chat, busy, confirmation, photos]);
 
-  const send = async (raw: string) => {
+  const attach = async (files: FileList | File[] | null) => {
+    if (!files) return;
+    const picked = Array.from(files).filter(isImageFile);
+    if (picked.length === 0) return;
+
+    setPhotoError(null);
+    const room = MAX_IMAGES - photos.length;
+    if (room <= 0) {
+      setPhotoError(`You can send up to ${MAX_IMAGES} photos at a time.`);
+      return;
+    }
+    if (picked.length > room) setPhotoError(`Only the first ${room} were attached.`);
+
+    const added: ChatImage[] = [];
+    for (const file of picked.slice(0, room)) {
+      try {
+        added.push(await readImage(file));
+      } catch (err) {
+        setPhotoError(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (added.length > 0) setPhotos((current) => [...current, ...added].slice(0, MAX_IMAGES));
+  };
+
+  const send = async (raw: string, attachments: ChatImage[] = photos) => {
     const content = raw.trim();
-    if (!content || busy) return;
+    if ((!content && attachments.length === 0) || busy) return;
     const store = useStore.getState();
     if (!store.apiKey) return;
 
     setText('');
-    store.pushChat({ id: uid(), role: 'user', text: content });
+    setPhotos([]);
+    setPhotoError(null);
+    store.pushChat({
+      id: uid(),
+      role: 'user',
+      text: content,
+      ...(attachments.length > 0 ? { images: attachments } : {}),
+    });
 
     const replyId = uid();
     store.pushChat({ id: replyId, role: 'assistant', text: '', actions: [], pending: true });
@@ -70,6 +106,7 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
           },
         },
         store.apiKey,
+        attachments,
       );
       useStore.getState().patchChat(replyId, { text: reply, pending: false, actions: [...actions] });
     } catch (err) {
@@ -86,15 +123,39 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
 
   return (
     <section
+      onDragOver={(e) => {
+        if (!apiKey || !e.dataTransfer.types.includes('Files')) return;
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        // Only when the pointer actually leaves the panel, not on every child.
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        setDragging(false);
+      }}
+      onDrop={(e) => {
+        if (!apiKey) return;
+        e.preventDefault();
+        setDragging(false);
+        void attach(e.dataTransfer.files);
+      }}
       className={
         'flex shrink-0 flex-col border-line bg-panel ' +
         // Full-screen sheet below md (the header is two rows tall there, so a
         // partial sheet would cover the nav); a static column at md and up.
         'fixed inset-0 z-50 shadow-2xl transition-transform duration-200 ' +
         (open ? 'translate-y-0' : 'translate-y-full') +
-        ' md:static md:z-auto md:w-80 md:translate-y-0 md:border-l md:shadow-none xl:w-96'
+        // relative rather than static at md so the drag overlay, which is
+        // positioned against the fixed sheet on phones, still has a frame here.
+        ' md:relative md:z-auto md:w-80 md:translate-y-0 md:border-l md:shadow-none xl:w-96'
       }
     >
+      {dragging && (
+        <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-accent bg-accent/[0.08]">
+          <span className="text-sm font-medium text-ink">Drop a photo to read it</span>
+        </div>
+      )}
+
       <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-2.5">
         <Sparkle className="h-4 w-4 text-accent" />
         <span className="font-display text-base text-ink">Assistant</span>
@@ -137,7 +198,8 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
           <div className="space-y-3 pt-2">
             <p className="text-sm leading-relaxed text-ink-soft">
               Describe what you want on the calendar and it gets added. You can also ask what&apos;s
-              coming up, move things, or cancel them.
+              coming up, move things, or cancel them. Send a photo of a flyer or an invite and it
+              gets read off the picture.
             </p>
             {!apiKey && (
               <button
@@ -194,30 +256,82 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
         }}
         className="shrink-0 border-t border-line p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:pb-2"
       >
-        <div className="flex items-end gap-2 rounded-lg border border-line bg-canvas p-1.5 focus-within:border-line-strong">
-          <textarea
-            ref={inputRef}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                void send(text);
-              }
-            }}
-            rows={1}
-            placeholder={apiKey ? 'Lunch with Sam Friday at noon…' : 'Add an API key to enable the assistant'}
-            disabled={!apiKey}
-            className="max-h-32 min-h-[1.5rem] flex-1 resize-none bg-transparent px-1 text-sm text-ink outline-none placeholder:text-ink-faint disabled:cursor-not-allowed"
-          />
-          <button
-            type="submit"
-            disabled={!apiKey || busy || text.trim() === ''}
-            aria-label="Send"
-            className="rounded-md bg-accent p-1.5 text-white transition disabled:opacity-30"
-          >
-            <Send className="h-3.5 w-3.5" />
-          </button>
+        {photoError && <p className="px-1 pb-1.5 text-xs text-red-600 dark:text-red-400">{photoError}</p>}
+
+        <div className="rounded-lg border border-line bg-canvas p-1.5 focus-within:border-line-strong">
+          {photos.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-1 pb-1.5">
+              {photos.map((p) => (
+                <div key={p.id} className="group relative">
+                  <img
+                    src={dataUrl(p)}
+                    alt={p.name}
+                    title={p.name}
+                    className="h-14 w-14 rounded-md border border-line object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setPhotos((current) => current.filter((c) => c.id !== p.id))}
+                    aria-label={`Remove ${p.name}`}
+                    className="absolute -right-1.5 -top-1.5 rounded-full border border-line bg-panel p-0.5 text-ink-soft shadow-sm hover:text-ink"
+                  >
+                    <Close className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex items-end gap-1.5">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void attach(e.target.files);
+                // Let the same file be picked again after it is removed.
+                e.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={!apiKey || photos.length >= MAX_IMAGES}
+              aria-label="Attach a photo"
+              title="Attach a photo"
+              className="rounded-md p-1.5 text-ink-faint transition hover:text-ink disabled:opacity-30 disabled:hover:text-ink-faint"
+            >
+              <Photo className="h-4 w-4" />
+            </button>
+            <textarea
+              ref={inputRef}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onPaste={(e) => {
+                if (apiKey && e.clipboardData.files.length > 0) void attach(e.clipboardData.files);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void send(text);
+                }
+              }}
+              rows={1}
+              placeholder={apiKey ? 'Lunch with Sam Friday at noon…' : 'Add an API key to enable the assistant'}
+              disabled={!apiKey}
+              className="max-h-32 min-h-[1.5rem] flex-1 resize-none self-center bg-transparent px-1 text-sm text-ink outline-none placeholder:text-ink-faint disabled:cursor-not-allowed"
+            />
+            <button
+              type="submit"
+              disabled={!apiKey || busy || (text.trim() === '' && photos.length === 0)}
+              aria-label="Send"
+              className="rounded-md bg-accent p-1.5 text-white transition disabled:opacity-30"
+            >
+              <Send className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
       </form>
     </section>
@@ -227,10 +341,25 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
 function Bubble({ message }: { message: ChatMessage }) {
   if (message.role === 'user') {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-ink px-3 py-1.5 text-sm text-panel">
-          {message.text}
-        </div>
+      <div className="flex flex-col items-end gap-1.5">
+        {message.images && message.images.length > 0 && (
+          <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
+            {message.images.map((img) => (
+              <img
+                key={img.id}
+                src={dataUrl(img)}
+                alt={img.name}
+                title={img.name}
+                className="max-h-40 max-w-[8.5rem] rounded-xl border border-line object-cover"
+              />
+            ))}
+          </div>
+        )}
+        {message.text && (
+          <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-ink px-3 py-1.5 text-sm text-panel">
+            {message.text}
+          </div>
+        )}
       </div>
     );
   }

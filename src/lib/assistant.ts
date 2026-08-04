@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { betaTool } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import type { BetaMessageParam } from '@anthropic-ai/sdk/resources/beta';
 import { addMinutes, format } from 'date-fns';
-import type { Calendar, CalendarEvent } from '../types';
+import type { Calendar, CalendarEvent, ChatImage } from '../types';
 import type { NewEvent } from '../store';
 import { localTimeZone, parse, toLocalISO } from './dates';
 
@@ -16,6 +16,13 @@ const EFFORT = 'medium' as const;
 
 /** Kept short deliberately — the calendar is the state, not the transcript. */
 const HISTORY_TURNS = 12;
+
+/**
+ * Photos are re-sent with every later turn, so they are the expensive part of
+ * the history. Keeping them for the last few messages covers the follow-up
+ * ("the second one on that flyer too") without paying for them all session.
+ */
+const IMAGE_HISTORY_MESSAGES = 4;
 
 export interface AssistantDeps {
   getEvents: () => CalendarEvent[];
@@ -44,6 +51,23 @@ let history: BetaMessageParam[] = [];
 
 export function resetConversation(): void {
   history = [];
+}
+
+/** Trim to the recent window, and drop photos that have fallen out of the recent one. */
+function trimHistory(): void {
+  if (history.length > HISTORY_TURNS) history = history.slice(-HISTORY_TURNS);
+
+  const stale = history.length - IMAGE_HISTORY_MESSAGES;
+  history = history.map((message, i) => {
+    if (i >= stale || !Array.isArray(message.content)) return message;
+    const kept = message.content.filter((block) => block.type !== 'image');
+    if (kept.length === message.content.length) return message;
+    return {
+      ...message,
+      // A message that was nothing but photos still needs content to be valid.
+      content: kept.length > 0 ? kept : [{ type: 'text', text: '[photo, no longer attached]' }],
+    };
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -88,6 +112,16 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     'or geocode it, and never invent one you were not given. A video call link or',
     'meeting room ("Zoom", "Meet", "Conference Room B") is a location too. When the',
     'place *is* the point ("Costco run"), leave it in the title and set no location.',
+    '',
+    '## Photos',
+    'The user can attach photos — a flyer, a screenshot of another calendar or a',
+    'confirmation email, a whiteboard, a handwritten note. Read the details',
+    'straight off the image and make the changes it implies; a photo sent with no',
+    'message at all means "put what is in here on my calendar". Take the title,',
+    'day, time and place from what is actually written, and resolve anything',
+    'relative ("this Friday") against the current date below. A date with no year',
+    'means the next time it comes around. If part of it is unreadable or missing,',
+    'say so rather than filling it in.',
     '',
     '## Recurrence',
     'Recurring events are not supported yet. If asked for one, create the next few',
@@ -462,12 +496,32 @@ function toAssistantError(err: unknown): AssistantError {
   return new AssistantError(err instanceof Error ? err.message : String(err), 'unknown');
 }
 
-export async function sendToAssistant(userText: string, deps: AssistantDeps, apiKey: string): Promise<string> {
+export async function sendToAssistant(
+  userText: string,
+  deps: AssistantDeps,
+  apiKey: string,
+  images: ChatImage[] = [],
+): Promise<string> {
   const client = makeClient(apiKey);
   const calendars = deps.getCalendars();
 
-  history.push({ role: 'user', content: userText });
-  if (history.length > HISTORY_TURNS) history = history.slice(-HISTORY_TURNS);
+  if (images.length === 0) {
+    history.push({ role: 'user', content: userText });
+  } else {
+    history.push({
+      role: 'user',
+      content: [
+        ...images.map((img) => ({
+          type: 'image' as const,
+          source: { type: 'base64' as const, media_type: img.mediaType, data: img.data },
+        })),
+        // An empty text block is rejected, so a photo-only message sends no text
+        // at all and leans on the Photos section of the prompt.
+        ...(userText ? [{ type: 'text' as const, text: userText }] : []),
+      ],
+    });
+  }
+  trimHistory();
 
   try {
     const runner = client.beta.messages.toolRunner({
