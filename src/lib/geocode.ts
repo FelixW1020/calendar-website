@@ -23,6 +23,32 @@ import type { Place } from '../types';
 const PHOTON = 'https://photon.komoot.io/api/';
 const NOMINATIM = 'https://nominatim.openstreetmap.org/search';
 
+/* -------------------------------------------------------------------------- */
+/* Country                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Suggestions are United States only. Without this, "Durham" is as likely to
+ * mean England as North Carolina and "6 hotz" surfaces four Swiss addresses
+ * before the first American one — every foreign hit is a slot a real
+ * suggestion could have used.
+ *
+ * Change these three constants together to point somewhere else.
+ */
+const COUNTRY_CODE = 'US';
+const COUNTRY_NAME = 'United States';
+
+/**
+ * The 50 states, Puerto Rico and the US Virgin Islands. The box is the coarse
+ * filter — it keeps the provider from spending its results on other continents
+ * — and the country code is the exact one, since this rectangle also covers
+ * chunks of Canada, Mexico and the Caribbean.
+ *
+ * The far Aleutians cross the antimeridian into positive longitude and fall
+ * outside; so do Guam and American Samoa, which no single box can include.
+ */
+const COUNTRY_BBOX = '-172,17.5,-64.5,72';
+
 export interface Suggestion extends Place {
   /** The bold first line — a venue name, or the street address. */
   name: string;
@@ -85,6 +111,7 @@ interface PhotonProps {
   state?: string;
   postcode?: string;
   country?: string;
+  countrycode?: string;
 }
 
 /** Drop repeats and empties, so "Durham, Durham, NC" reads as "Durham, NC". */
@@ -106,17 +133,18 @@ function fromPhoton(feature: {
   const p = feature.properties;
   const [lon, lat] = feature.geometry?.coordinates ?? [];
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (p.countrycode !== COUNTRY_CODE) return null;
 
   const street = p.housenumber && p.street ? `${p.housenumber} ${p.street}` : p.street;
-  const name = p.name || street || p.city || p.state || p.country;
+  const name = p.name || street || p.city || p.state;
   if (!name) return null;
 
+  // No country on the end: every row says the same thing, so it is only noise.
   const detail = joinParts([
     name === street ? null : street,
     p.city || p.district || p.county,
     p.state,
     p.postcode,
-    p.country,
   ]);
 
   return {
@@ -133,7 +161,10 @@ function fromPhoton(feature: {
 async function searchPhoton(query: string, signal: AbortSignal): Promise<Suggestion[]> {
   const url = new URL(PHOTON);
   url.searchParams.set('q', query);
-  url.searchParams.set('limit', '6');
+  url.searchParams.set('bbox', COUNTRY_BBOX);
+  // Asked for more than are shown, because the country check below and the
+  // relevance filter after it both discard rows.
+  url.searchParams.set('limit', '15');
   const bias = readBias();
   if (bias) {
     url.searchParams.set('lat', String(bias.lat));
@@ -163,6 +194,7 @@ async function searchNominatim(query: string, signal: AbortSignal): Promise<Sugg
   url.searchParams.set('format', 'jsonv2');
   url.searchParams.set('limit', '6');
   url.searchParams.set('addressdetails', '1');
+  url.searchParams.set('countrycodes', COUNTRY_CODE.toLowerCase());
 
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`nominatim ${res.status}`);
@@ -179,7 +211,10 @@ async function searchNominatim(query: string, signal: AbortSignal): Promise<Sugg
     const lat = Number(r.lat);
     const lon = Number(r.lon);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-    const parts = r.display_name.split(',').map((s) => s.trim());
+    const parts = r.display_name
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== COUNTRY_NAME);
     const name = r.name?.trim() || parts[0];
     const detail = joinParts(parts.filter((p) => p.toLowerCase() !== name.toLowerCase()));
     out.push({
@@ -360,9 +395,16 @@ function relevant(raw: Suggestion[], query: string): Suggestion[] {
     if (!match) continue;
     kept.push(match.approximate && houseNumber ? withHouseNumber(s, houseNumber) : s);
   }
-  // An exact building beats the street it stands on.
-  return dedupe(kept.sort((a, b) => Number(a.approximate ?? false) - Number(b.approximate ?? false)));
+  // An exact building beats the street it stands on. Beyond half a dozen, the
+  // list is a scroll rather than a choice — the provider ranks by relevance,
+  // so the tail is the part worth dropping.
+  const ranked = kept.sort(
+    (a, b) => Number(a.approximate ?? false) - Number(b.approximate ?? false),
+  );
+  return dedupe(ranked).slice(0, MAX_SUGGESTIONS);
 }
+
+const MAX_SUGGESTIONS = 6;
 
 /**
  * Suggestions while typing come from Photon alone. Nominatim is the better

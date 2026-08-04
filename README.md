@@ -39,6 +39,16 @@ keyless — there is nothing to configure and no billing account to attach.
 Results are biased toward the last place you picked, so "Whole Foods" means the
 one near you. Nothing is sent anywhere until you type at least three characters.
 
+**Suggestions are United States only** — the 50 states, Puerto Rico and the US
+Virgin Islands. Otherwise "Durham" is as likely to be England as North Carolina,
+and every foreign hit costs a slot a real suggestion could have used. Now
+`london` finds Kentucky and `paris` finds Texas. It is enforced twice: a
+bounding box on the request, so the provider does not spend its results on other
+continents, and an exact country check on the way back, since that rectangle
+also covers parts of Canada, Mexico and the Caribbean. To point it somewhere
+else, change `COUNTRY_CODE`, `COUNTRY_NAME` and `COUNTRY_BBOX` at the top of
+`src/lib/geocode.ts` together.
+
 Two rules keep the suggestions honest, and they matter more than the choice of
 provider:
 
