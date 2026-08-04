@@ -235,74 +235,251 @@ async function searchNominatim(query: string, signal: AbortSignal): Promise<Sugg
 /* -------------------------------------------------------------------------- */
 
 /**
- * Nobody types "Road" or "Northwest". Both sides of a comparison are expanded
- * to the long form so "rd" matches "Road" and "n" matches "North".
+ * Abbreviations are alternatives, not replacements — the distinction matters.
+ * Rewriting "st" to "street" turns St. Louis into Louis Street, and rewriting a
+ * lone "s" turns "Trader Joe's" into "Trader Joe'south". So a word matches if
+ * *any* of its forms does, and "st" simply carries three.
  */
-const ABBREVIATIONS: Record<string, string> = {
-  rd: 'road',
-  st: 'street',
-  str: 'street',
-  ave: 'avenue',
-  av: 'avenue',
-  dr: 'drive',
-  ln: 'lane',
-  blvd: 'boulevard',
-  ct: 'court',
-  pl: 'place',
-  ter: 'terrace',
-  cir: 'circle',
-  hwy: 'highway',
-  pkwy: 'parkway',
-  sq: 'square',
-  mt: 'mount',
-  ft: 'fort',
-  n: 'north',
-  s: 'south',
-  e: 'east',
-  w: 'west',
-  ne: 'northeast',
-  nw: 'northwest',
-  se: 'southeast',
-  sw: 'southwest',
-};
+const SYNONYMS: [string, string][] = [
+  ['street', 'st'],
+  ['saint', 'st'],
+  ['road', 'rd'],
+  ['avenue', 'ave'],
+  ['avenue', 'av'],
+  ['drive', 'dr'],
+  ['lane', 'ln'],
+  ['boulevard', 'blvd'],
+  ['court', 'ct'],
+  ['place', 'pl'],
+  ['terrace', 'ter'],
+  ['circle', 'cir'],
+  ['highway', 'hwy'],
+  ['parkway', 'pkwy'],
+  ['square', 'sq'],
+  ['mount', 'mt'],
+  ['fort', 'ft'],
+  ['north', 'n'],
+  ['south', 's'],
+  ['east', 'e'],
+  ['west', 'w'],
+  ['northeast', 'ne'],
+  ['northwest', 'nw'],
+  ['southeast', 'se'],
+  ['southwest', 'sw'],
+  // Street names are written both ways: Fifth Avenue is signed 5th Ave.
+  ['first', '1st'],
+  ['second', '2nd'],
+  ['third', '3rd'],
+  ['fourth', '4th'],
+  ['fifth', '5th'],
+  ['sixth', '6th'],
+  ['seventh', '7th'],
+  ['eighth', '8th'],
+  ['ninth', '9th'],
+  ['tenth', '10th'],
+];
+
+/**
+ * States are one-directional: typing "nc" may match "North Carolina", but
+ * typing "New York" must find New York, not settle for anything in NY. Someone
+ * writing the words means the city; someone writing the code means the state.
+ *
+ * The list is needed at all because Photon returns "NC" for one result and
+ * "North Carolina" for the next.
+ */
+const STATE_CODES: [string, string][] = [
+  ['alabama', 'al'],
+  ['alaska', 'ak'],
+  ['arizona', 'az'],
+  ['arkansas', 'ar'],
+  ['california', 'ca'],
+  ['colorado', 'co'],
+  ['connecticut', 'ct'],
+  ['delaware', 'de'],
+  ['florida', 'fl'],
+  ['georgia', 'ga'],
+  ['hawaii', 'hi'],
+  ['idaho', 'id'],
+  ['illinois', 'il'],
+  ['indiana', 'in'],
+  ['iowa', 'ia'],
+  ['kansas', 'ks'],
+  ['kentucky', 'ky'],
+  ['louisiana', 'la'],
+  ['maine', 'me'],
+  ['maryland', 'md'],
+  ['massachusetts', 'ma'],
+  ['michigan', 'mi'],
+  ['minnesota', 'mn'],
+  ['mississippi', 'ms'],
+  ['missouri', 'mo'],
+  ['montana', 'mt'],
+  ['nebraska', 'ne'],
+  ['nevada', 'nv'],
+  ['new hampshire', 'nh'],
+  ['new jersey', 'nj'],
+  ['new mexico', 'nm'],
+  ['new york', 'ny'],
+  ['north carolina', 'nc'],
+  ['north dakota', 'nd'],
+  ['ohio', 'oh'],
+  ['oklahoma', 'ok'],
+  ['oregon', 'or'],
+  ['pennsylvania', 'pa'],
+  ['rhode island', 'ri'],
+  ['south carolina', 'sc'],
+  ['south dakota', 'sd'],
+  ['tennessee', 'tn'],
+  ['texas', 'tx'],
+  ['utah', 'ut'],
+  ['vermont', 'vt'],
+  ['virginia', 'va'],
+  ['washington', 'wa'],
+  ['west virginia', 'wv'],
+  ['wisconsin', 'wi'],
+  ['wyoming', 'wy'],
+  ['puerto rico', 'pr'],
+];
+
+const FORMS = new Map<string, string[]>();
+const addForm = (token: string, alternative: string) =>
+  FORMS.set(token, [...(FORMS.get(token) ?? [token]), alternative]);
+
+for (const [long, short] of SYNONYMS) {
+  addForm(long, short);
+  addForm(short, long);
+}
+for (const [name, code] of STATE_CODES) addForm(code, name);
+
+/** Every spelling a typed word is allowed to match. */
+function formsOf(token: string): string[] {
+  return FORMS.get(token) ?? [token];
+}
+
+/** Two-word state names, so "new york" can be recognised as one thing. */
+const TWO_WORD_STATES = new Set(
+  STATE_CODES.filter(([name]) => name.includes(' ')).map(([name]) => name),
+);
+
+/**
+ * Words that carry no location: filler, and the unit part of an address, which
+ * map data does not record. "Suite 200" is about the inside of the building.
+ */
+const IGNORED = new Set(['the', 'of', 'and', 'a', 'at', 'in', 'on']);
+// "fl" is missing on purpose: it is Florida far more often than it is a floor.
+const UNIT_WORDS = new Set([
+  'suite',
+  'ste',
+  'apt',
+  'apartment',
+  'unit',
+  'floor',
+  'rm',
+  'room',
+  '#',
+]);
 
 export function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean)
-    .map((t) => ABBREVIATIONS[t] ?? t);
+  return (
+    text
+      .toLowerCase()
+      // Apostrophes are dropped rather than split on, so that "Trader Joe's",
+      // "Trader Joes" and the curly-quoted version all become the same words.
+      .replace(/['’`]/g, '')
+      .split(/[^a-z0-9#]+/)
+      .filter(Boolean)
+  );
 }
 
 /**
- * Send the long form to the geocoder, not what was typed. This single change
- * is most of the accuracy: asked for "6 hotz rd" Photon offers 3rd Avenue in
- * New York, while "6 hotz road" finds the Hotz Roads — it indexes the spelled
- * out street type and cannot see through the abbreviation.
+ * The words a result has to account for: what was typed, less the filler, the
+ * unit ("suite 200"), and the leading house number, which is handled on its own
+ * because map data so often lacks it.
  */
+export function significantTokens(queryTokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < queryTokens.length; i++) {
+    const t = queryTokens[i];
+    if (i === 0 && /^\d+$/.test(t)) continue; // house number
+    if (IGNORED.has(t)) continue;
+    if (UNIT_WORDS.has(t)) {
+      // Skip the number that belongs to it, too.
+      if (/^\d+[a-z]?$/.test(queryTokens[i + 1] ?? '')) i++;
+      continue;
+    }
+    // "new york" is one place, not two words, and counting it twice would let a
+    // result get away with matching neither of them.
+    const pair = `${t} ${queryTokens[i + 1] ?? ''}`;
+    if (TWO_WORD_STATES.has(pair)) {
+      out.push(pair);
+      i++;
+      continue;
+    }
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Send the long form to the geocoder, since Photon indexes "Road" and cannot
+ * see through "Rd" — that is the difference between finding Hotz Road and being
+ * offered 3rd Avenue in New York. Only unambiguous street types are expanded:
+ * "st" is left alone precisely because it is as likely to mean Saint.
+ */
+const EXPANDABLE = new Set([
+  'rd',
+  'ave',
+  'av',
+  'blvd',
+  'ln',
+  'ct',
+  'ter',
+  'cir',
+  'hwy',
+  'pkwy',
+  'sq',
+  'dr',
+]);
+
+/**
+ * The unit goes too. Map data records buildings, not the offices inside them,
+ * so "suite 200" in the query is a word the provider can only be confused by —
+ * it is what turned a findable address into no results at all.
+ */
+const UNIT_PHRASE = /[,\s]*\b(suite|ste|apt|apartment|unit|floor|rm|room)\b\.?\s*#?\s*[\w-]*/gi;
+
 export function expandQuery(query: string): string {
   return query
+    .replace(UNIT_PHRASE, '')
     .split(/([^A-Za-z0-9]+)/)
-    .map((part) => ABBREVIATIONS[part.toLowerCase()] ?? part)
-    .join('');
+    .map((part) => {
+      const lower = part.toLowerCase();
+      return EXPANDABLE.has(lower) ? (FORMS.get(lower)?.[1] ?? part) : part;
+    })
+    .join('')
+    .replace(/\s*,\s*,/g, ',')
+    .trim();
 }
 
 /**
- * Does this result actually answer what was typed?
+ * Does this result answer what was typed?
  *
- * This is the guard that matters. Geocoders would rather return something than
- * nothing — a search for "6 hotz rd, lin" came back with Lincolnshire
- * postcodes, none of them on any road called Hotz. Showing those is worse than
- * showing nothing, so every word of the query has to appear in the result.
+ * Geocoders would always rather return something than nothing — "6 hotz rd,
+ * lin" came back with Lincolnshire postcodes, none of them on a road called
+ * Hotz — so a result has to earn its place in the list.
  *
- * Words match by prefix, since the user is mid-type and "chap" is a fair match
- * for "Chapel". Numbers must match exactly — house number 6 is not 6032 — with
- * one exception: OpenStreetMap knows most streets but only some of the
- * buildings on them, so a leading house number is allowed to be missing. That
- * is reported back, because it makes the pin street-level rather than exact.
+ * Not every word, though. That was too strict in the other direction: an
+ * address carries words map data does not ("Apple *Store* Fifth Avenue"), and
+ * one unmatched word was killing an otherwise perfect result. What is required
+ * is that most of the words match, and specifically the two that carry the
+ * meaning — the longest one, which is the name or the street, and the last one,
+ * which is where it is. That keeps "duke chapel durham" from matching the Duke
+ * Chapel in Tennessee.
  */
+const MIN_MATCH_RATIO = 0.7;
+
 interface Match {
-  /** The street matched but the building is not in the map data. */
+  /** The street matched but this exact building is not in the map data. */
   approximate: boolean;
 }
 
@@ -313,31 +490,53 @@ export function matchQuery(
   houseNumber?: string,
 ): Match | null {
   const labelTokens = tokenize(label);
-  const has = (q: string) =>
-    labelTokens.some((l) => (/^\d+$/.test(q) ? l === q : l.startsWith(q)));
+  const joined = labelTokens.join(' ');
+  const has = (token: string) =>
+    formsOf(token).some((form) =>
+      // Words match by prefix, since the user is mid-type and "chap" is a fair
+      // match for "Chapel". Bare numbers must match exactly: 6 is not 6032.
+      // A form with a space in it is a phrase, and has to be found as one.
+      form.includes(' ')
+        ? joined.includes(form)
+        : labelTokens.some((l) => (/^\d+$/.test(form) ? l === form : l.startsWith(form))),
+    );
+
+  const required = significantTokens(queryTokens);
+  if (required.length === 0) return null;
+
+  const longest = required.reduce((a, b) => (b.length > a.length ? b : a));
+  const last = required[required.length - 1];
+  if (!has(longest) || !has(last)) return null;
+
+  const matched = required.filter(has).length;
+  if (matched / required.length < MIN_MATCH_RATIO) return null;
 
   const typedNumber = /^\d+$/.test(queryTokens[0] ?? '') ? queryTokens[0] : null;
-  const rest = typedNumber ? queryTokens.slice(1) : queryTokens;
-
-  // The street, town and anything else typed must all be there.
-  if (rest.length === 0 || !rest.every(has)) return null;
   if (!typedNumber) return { approximate: false };
 
-  // A result that knows its own number must be the number that was asked for:
-  // 3025 Main Street is not 302 Main Street.
-  if (houseNumber) return houseNumber === typedNumber ? { approximate: false } : null;
+  // The building itself is mapped, and it is the one that was asked for.
+  if (houseNumber === typedNumber || (!houseNumber && has(typedNumber))) {
+    return { approximate: false };
+  }
 
-  // No number on the result — the street matched and the building is simply
-  // not in the map data, which is the common case outside dense cities.
-  return { approximate: !has(typedNumber) };
+  // Right street, different door — or a street with no numbers mapped at all.
+  // Still the block that was asked for, so it is offered as approximate.
+  return { approximate: true };
 }
 
-/** Re-attach the number the map data is missing, so the text reads as typed. */
+/**
+ * Show the number that was typed, not the neighbour's. The result's own number
+ * comes off the front of the name first, so "2 Hanover Square" does not become
+ * "2 6 Hanover Square".
+ */
 function withHouseNumber(s: Suggestion, houseNumber: string): Suggestion {
+  const name = s.name.replace(/^\d+[a-z]?\s+/i, '');
+  const detail = s.detail.replace(/^\d+[a-z]?\s+/i, '');
   return {
     ...s,
-    name: `${houseNumber} ${s.name}`,
-    label: `${houseNumber} ${s.label}`,
+    name: `${houseNumber} ${name}`,
+    detail,
+    label: joinParts([`${houseNumber} ${name}`, detail]),
     approximate: true,
   };
 }
@@ -376,10 +575,12 @@ function withoutTrailingFragment(query: string): string | null {
 function dedupe(results: Suggestion[]): Suggestion[] {
   const seen = new Set<string>();
   return results.filter((s) => {
-    // Two providers describing the same doorway agree to about a metre.
-    const key = `${s.lat.toFixed(4)},${s.lon.toFixed(4)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
+    // Coordinates, because two providers describing the same doorway agree to
+    // about a metre; and the label, because several buildings on one street all
+    // relabel to the same typed address once the house number is applied.
+    const keys = [`${s.lat.toFixed(4)},${s.lon.toFixed(4)}`, s.label.toLowerCase()];
+    if (keys.some((k) => seen.has(k))) return false;
+    for (const k of keys) seen.add(k);
     return true;
   });
 }
@@ -423,6 +624,10 @@ export async function searchPlaces(query: string, signal: AbortSignal): Promise<
   const hit = cache.get(key);
   if (hit) return hit;
 
+  // "Room 302" is entirely unit and number: nothing is left to search for, and
+  // asking anyway is how the provider gets sent an empty query.
+  if (significantTokens(tokenize(query)).length === 0) return [];
+
   // The last word may be a town half-typed. If the full string finds nothing,
   // try again without it — results are still filtered against the full text, so
   // a town starting with "lin" is what comes back, if one exists.
@@ -431,9 +636,11 @@ export async function searchPlaces(query: string, signal: AbortSignal): Promise<
   );
 
   for (const attempt of attempts) {
+    const sent = expandQuery(attempt);
+    if (sent.length < 3) continue;
     let raw: Suggestion[];
     try {
-      raw = await searchPhoton(expandQuery(attempt), signal);
+      raw = await searchPhoton(sent, signal);
     } catch (err) {
       if (signal.aborted) throw err;
       console.warn('[geocode] place search failed', err);

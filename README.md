@@ -49,22 +49,32 @@ also covers parts of Canada, Mexico and the Caribbean. To point it somewhere
 else, change `COUNTRY_CODE`, `COUNTRY_NAME` and `COUNTRY_BBOX` at the top of
 `src/lib/geocode.ts` together.
 
-Two rules keep the suggestions honest, and they matter more than the choice of
-provider:
+What matters more than the choice of provider is how the query is asked and how
+the answers are judged:
 
-- **Street types are spelled out before searching.** Photon indexes "Road" and
-  cannot see through "Rd" — asked for `6 hotz rd` it will offer 3rd Avenue in
-  New York, and asked for `6 hotz road` it finds the Hotz Roads. Same for `Dr`,
-  `Ave`, `NW` and the rest.
-- **Every result is checked against what you typed**, and dropped if it does not
-  contain it. Words match by prefix, since you are mid-type, but numbers match
-  exactly — 302 Main St never offers you 3025. When nothing matches, the field
-  says so rather than showing something irrelevant; your text is still saved as
-  typed.
+- **Unambiguous street types are spelled out before searching.** Photon indexes
+  "Road" and cannot see through "Rd" — asked for `6 hotz rd` it offers 3rd
+  Avenue in New York, and asked for `6 hotz road` it finds the Hotz Roads. `St`
+  is deliberately left alone, since it is as often Saint as Street, and so is
+  `NE`, which is Nebraska as often as northeast.
+- **The unit is dropped.** Map data records buildings, not the offices inside
+  them, so `Suite 200` in the middle of an address only confuses the search.
+- **Every result is judged against what you typed.** Words match by prefix,
+  since you are mid-type; abbreviations match either way round, so `st louis`
+  finds Saint Louis and `durham nc` matches Durham, North Carolina; and
+  `Trader Joe's`, `Trader Joes` and the curly-quoted version are one name.
+- **Not every word has to match, but the right ones do.** An address carries
+  words the map does not — `Apple *Store* Fifth Avenue` — and one such word
+  should not sink a perfect result. So most words must match, and specifically
+  the longest one and the last one: the thing and where it is. That is what
+  stops `duke chapel durham` matching the Duke Chapel in Tennessee.
 
-A suggestion tagged **approx.** means the street is in the map data but the
-building is not, which is common outside dense cities. The pin lands on the
-street rather than the door.
+When nothing matches, the field says so rather than showing something
+irrelevant, and your text is still saved as typed.
+
+A suggestion tagged **approx.** is the right street but not the exact door —
+either the building is not in the map data, which is common outside dense
+cities, or only its neighbours are. The pin lands on the block.
 
 [Nominatim](https://nominatim.openstreetmap.org) is used in exactly one place —
 the single background lookup when an event is opened — because the OSM

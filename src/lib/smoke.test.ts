@@ -16,6 +16,7 @@ import {
   mapEmbedUrl,
   mapsUrl,
   matchQuery,
+  significantTokens,
   tokenize,
 } from './geocode';
 import type { CalendarEvent } from '../types';
@@ -178,10 +179,33 @@ console.log('\nplace matching');
   // "6 hotz rd" come back as 3rd Avenue, New York.
   assert.equal(expandQuery('6 hotz rd, lin'), '6 hotz road, lin');
   assert.equal(expandQuery('1364 Campus Dr'), '1364 Campus drive');
-  assert.equal(expandQuery('100 NW 5th Ave'), '100 northwest 5th avenue');
+  // Ambiguous ones are left alone: "st" is as often Saint as Street, and "ne"
+  // is Nebraska as well as northeast.
+  assert.equal(expandQuery('st louis'), 'st louis');
+  assert.equal(expandQuery('Omaha NE'), 'Omaha NE');
   // A word that merely starts with an abbreviation is left alone.
   assert.equal(expandQuery('Stockholm'), 'Stockholm');
-  ok('street types are spelled out before searching');
+  // The unit is about the inside of the building; map data has no idea.
+  assert.equal(expandQuery('1364 Campus Dr, Suite 200, Durham'), '1364 Campus drive, Durham');
+  ok('street types are spelled out before searching, ambiguous ones are not');
+}
+{
+  // "Trader Joe's", "Trader Joes" and the curly-quoted form are one name.
+  assert.deepEqual(tokenize("Trader Joe's"), ['trader', 'joes']);
+  assert.deepEqual(tokenize('Trader Joe’s'), tokenize('trader joes'));
+  // The unit, and the filler, carry no location.
+  assert.deepEqual(significantTokens(tokenize('1364 Campus Dr, Suite 200, Durham')), [
+    'campus',
+    'dr',
+    'durham',
+  ]);
+  assert.deepEqual(significantTokens(tokenize('The Cheesecake Factory')), [
+    'cheesecake',
+    'factory',
+  ]);
+  // A room number is not a place, and nothing is left to search for.
+  assert.deepEqual(significantTokens(tokenize('Room 302')), []);
+  ok('names, units and filler are read the way a person writes them');
 }
 {
   const m = (q: string, label: string) => matchQuery(tokenize(q), label);
@@ -204,8 +228,11 @@ console.log('\nplace matching');
     m('1364 campus dr, dur', 'West Duke Building, 1364 Campus Drive, Durham, NC', '1364'),
     { approximate: false },
   );
-  // A different building on the right street is not "close enough".
-  assert.equal(m('302 main st', '3025 Main Street, Springfield', '3025'), null);
+  // The neighbour's door is the right block, but it is not the address typed,
+  // so it is offered as approximate rather than as an exact answer.
+  assert.deepEqual(m('302 main st', '3025 Main Street, Springfield', '3025'), {
+    approximate: true,
+  });
   ok('a mapped building is told apart from its street, and from its neighbours');
 }
 {
@@ -213,9 +240,32 @@ console.log('\nplace matching');
 
   // Half-typed words match by prefix; numbers never do.
   assert.ok(m('duke chap', 'Duke Chapel, 401 Chapel Drive, Durham, NC'));
-  assert.equal(m('room 302', 'Room 30, Some Building'), null);
-  assert.equal(m('durham 27705', 'Durham, NC, 27701, United States'), null);
+  assert.equal(m('durham 27705', 'Durham, NC, 27701'), null);
   ok('words match by prefix, numbers exactly');
+}
+{
+  const m = (q: string, label: string) => matchQuery(tokenize(q), label);
+
+  // Abbreviations are alternatives, not rewrites: "st" is Saint here and
+  // Street there, and a lone "s" is neither.
+  assert.ok(m('st louis', 'Saint Louis, Missouri'));
+  assert.ok(m('saint clair il', 'St. Clair, Illinois'));
+  assert.ok(m("trader joes durham", "Trader Joe's, 1800 Main Street, Durham, NC"));
+  // A state code may stand in for the state's name…
+  assert.ok(m('duke chapel durham nc', 'Duke Chapel, Chapel Drive, Durham, North Carolina'));
+  // …but writing the words means the place, not merely the state: this is
+  // Hanover Square in Horseheads, NY, and it is not what was asked for.
+  assert.equal(m('2 hanover square, new york, ny', 'Simon’s, 2 Hanover Square, Horseheads, NY'), null);
+  ok('abbreviations expand both ways, state names only one way');
+}
+{
+  const m = (q: string, label: string) => matchQuery(tokenize(q), label);
+
+  // A word the map data does not carry should not sink an otherwise perfect
+  // result — but the name and the place must still both be there.
+  assert.ok(m('apple store fifth avenue', 'Apple Fifth Avenue, 767 5th Avenue, New York, NY'));
+  assert.equal(m('duke chapel durham', 'Duke Chapel, Mt Ararat Road, Henderson, Tennessee'), null);
+  ok('an extra descriptive word is tolerated, a wrong city is not');
 }
 
 console.log(`\n${n} checks passed\n`);
