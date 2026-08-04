@@ -1,7 +1,9 @@
 import { useMemo, useState } from 'react';
 import type { CalendarEvent } from '../types';
 import { calendarColor, useStore, visibleEvents } from '../store';
-import { eventsOn, format, isSameDay, parse } from '../lib/dates';
+import { addDays, eventsOn, format, isSameDay, parse, startOfDay } from '../lib/dates';
+import { expandEvents, isSeriesEvent } from '../lib/recurrence';
+import { Repeat } from './Icons';
 
 interface Props {
   days: Date[];
@@ -17,7 +19,16 @@ export default function MonthView({ days, anchorMonth }: Props) {
   const setAnchor = useStore((s) => s.setAnchor);
   const setView = useStore((s) => s.setView);
 
-  const shown = useMemo(() => visibleEvents(events, calendars), [events, calendars]);
+  // Repeating events are stored once and expanded over the grid on screen.
+  const shown = useMemo(
+    () =>
+      expandEvents(
+        visibleEvents(events, calendars),
+        startOfDay(days[0]),
+        addDays(startOfDay(days[days.length - 1]), 1),
+      ),
+    [events, calendars, days],
+  );
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const weeks: Date[][] = [];
@@ -113,14 +124,17 @@ function Chip({ event, onSelect }: { event: CalendarEvent; onSelect: () => void 
   const calendars = useStore((s) => s.calendars);
   const color = calendarColor(calendars, event.calendarId);
 
+  const repeats = isSeriesEvent(event);
+
   if (event.allDay) {
     return (
       <button
         onClick={onSelect}
         style={{ background: color }}
-        className="event-chip block w-full truncate rounded px-1.5 py-[3px] text-left text-[11px] text-white"
+        className="event-chip flex w-full items-center gap-1 rounded px-1.5 py-[3px] text-left text-[11px] text-white"
       >
-        {event.title}
+        {repeats && <Repeat className="h-2.5 w-2.5 shrink-0" />}
+        <span className="truncate">{event.title}</span>
       </button>
     );
   }
@@ -135,6 +149,7 @@ function Chip({ event, onSelect }: { event: CalendarEvent; onSelect: () => void 
         {format(parse(event.start), 'h:mm')}
       </span>
       <span className="truncate text-ink">{event.title}</span>
+      {repeats && <Repeat className="ml-auto h-2.5 w-2.5 shrink-0 text-ink-faint" />}
     </button>
   );
 }

@@ -93,8 +93,8 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
           getEvents: () => useStore.getState().events,
           getCalendars: () => useStore.getState().calendars,
           createEvent: (e) => useStore.getState().createEvent(e),
-          updateEvent: (id, patch) => useStore.getState().updateEvent(id, patch),
-          deleteEvent: (id) => useStore.getState().deleteEvent(id),
+          updateEvent: (id, patch, scope) => useStore.getState().updateEventScoped(id, patch, scope),
+          deleteEvent: (id, scope) => useStore.getState().deleteEventScoped(id, scope),
           confirm: (prompt) => useStore.getState().askConfirmation(prompt),
           onAction: (line) => {
             actions.push(line);

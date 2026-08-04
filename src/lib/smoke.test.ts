@@ -8,7 +8,19 @@ import {
   daysIn,
   formatEventTime,
   eventsOn,
+  format,
+  parse,
 } from './dates';
+import {
+  describeRule,
+  expandEvents,
+  formatRule,
+  nextOccurrence,
+  occurrenceId,
+  parseRule,
+  resolveEvent,
+  ruleEndingBefore,
+} from './recurrence';
 import {
   directionsUrl,
   expandQuery,
@@ -145,6 +157,254 @@ console.log('\ndates');
   assert.equal(eventsOn([overnight], new Date(2026, 7, 5)).length, 1);
   assert.equal(eventsOn([overnight], new Date(2026, 7, 6)).length, 0);
   ok('an overnight event appears on both days it touches');
+}
+
+console.log('\nrecurrence');
+{
+  // The rule text round-trips through the model, ignoring how it was written.
+  assert.deepEqual(parseRule('FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE'), {
+    freq: 'WEEKLY',
+    interval: 2,
+    byDay: ['MO', 'WE'],
+  });
+  assert.equal(formatRule(parseRule('rrule:freq=daily;interval=1')!), 'FREQ=DAILY');
+  assert.equal(formatRule(parseRule('FREQ=MONTHLY;BYDAY=2TU')!), 'FREQ=MONTHLY;BYDAY=2TU');
+  assert.equal(formatRule(parseRule('FREQ=DAILY;UNTIL=20260901')!), 'FREQ=DAILY;UNTIL=20260901');
+  assert.equal(parseRule('every tuesday'), null);
+  assert.equal(parseRule(undefined), null);
+  ok('rules parse and re-serialise');
+}
+{
+  assert.equal(describeRule(parseRule('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR')!, day), 'Every weekday');
+  assert.equal(describeRule(parseRule('FREQ=WEEKLY')!, day), 'Weekly on Wednesday');
+  assert.equal(
+    describeRule(parseRule('FREQ=WEEKLY;INTERVAL=2;BYDAY=FR;COUNT=5')!, day),
+    'Every 2 weeks on Friday, 5 times',
+  );
+  assert.equal(describeRule(parseRule('FREQ=MONTHLY;BYDAY=-1TH')!, day), 'Monthly on the last Thursday');
+  ok('rules describe themselves in English');
+}
+
+/** A repeating event and the range one week of the grid would ask for. */
+const repeating = (rrule: string, start = at(9), end = at(10)): CalendarEvent => ({
+  ...ev('series', start, end),
+  recurrence: rrule,
+});
+const august = (from: number, to: number) => ({
+  from: new Date(2026, 7, from),
+  to: new Date(2026, 7, to),
+});
+
+{
+  // Aug 5 2026 is a Wednesday; the week runs Sun Aug 2 – Sat Aug 8.
+  const { from, to } = august(2, 9);
+  const week = expandEvents([repeating('FREQ=WEEKLY;BYDAY=MO,WE')], from, to);
+  assert.deepEqual(
+    week.map((e) => format(parse(e.start), 'EEE d')).sort(),
+    ['Wed 5'],
+    'the series starts on the 5th, so Monday the 3rd is before it',
+  );
+  const next = expandEvents([repeating('FREQ=WEEKLY;BYDAY=MO,WE')], new Date(2026, 7, 9), new Date(2026, 7, 16));
+  assert.deepEqual(next.map((e) => format(parse(e.start), 'EEE d')), ['Mon 10', 'Wed 12']);
+  assert.ok(next.every((e) => format(parse(e.start), 'HH:mm') === '09:00'), 'time of day is carried');
+  ok('a weekly rule lands on every day it names, and never before it starts');
+}
+{
+  // Every other week, so the 12th is skipped and the 19th is not.
+  const rule = 'FREQ=WEEKLY;INTERVAL=2;BYDAY=WE';
+  const out = expandEvents([repeating(rule)], new Date(2026, 7, 1), new Date(2026, 8, 1));
+  assert.deepEqual(out.map((e) => format(parse(e.start), 'd')), ['5', '19']);
+  ok('INTERVAL skips the weeks in between');
+}
+{
+  const capped = expandEvents([repeating('FREQ=DAILY;COUNT=3')], new Date(2026, 7, 1), new Date(2026, 8, 1));
+  assert.deepEqual(capped.map((e) => format(parse(e.start), 'd')), ['5', '6', '7']);
+  // COUNT is counted from the first occurrence, not from the window on screen.
+  const later = expandEvents([repeating('FREQ=DAILY;COUNT=3')], new Date(2026, 7, 7), new Date(2026, 8, 1));
+  assert.deepEqual(later.map((e) => format(parse(e.start), 'd')), ['7']);
+  const until = expandEvents([repeating('FREQ=DAILY;UNTIL=20260807')], new Date(2026, 7, 1), new Date(2026, 8, 1));
+  assert.deepEqual(until.map((e) => format(parse(e.start), 'd')), ['5', '6', '7'], 'UNTIL includes its day');
+  ok('COUNT and UNTIL end a series in the right place');
+}
+{
+  // Jan 31 monthly: February has no 31st, so it is skipped rather than moved.
+  const jan31 = ev('m', toLocalISO(new Date(2026, 0, 31, 9)), toLocalISO(new Date(2026, 0, 31, 10)));
+  const out = expandEvents(
+    [{ ...jan31, recurrence: 'FREQ=MONTHLY' }],
+    new Date(2026, 0, 1),
+    new Date(2026, 4, 1),
+  );
+  assert.deepEqual(out.map((e) => format(parse(e.start), 'MMM d')), ['Jan 31', 'Mar 31']);
+  ok('a monthly rule skips months that have no such day');
+}
+{
+  // "The second Tuesday", across a month boundary that shifts the date.
+  const aug11 = ev('n', toLocalISO(new Date(2026, 7, 11, 9)), toLocalISO(new Date(2026, 7, 11, 10)));
+  const out = expandEvents(
+    [{ ...aug11, recurrence: 'FREQ=MONTHLY;BYDAY=2TU' }],
+    new Date(2026, 7, 1),
+    new Date(2026, 10, 1),
+  );
+  assert.deepEqual(out.map((e) => format(parse(e.start), 'MMM d')), ['Aug 11', 'Sep 8', 'Oct 13']);
+  ok('the nth weekday of the month tracks the calendar');
+}
+{
+  // A deleted occurrence and an edited one both come out of the rule.
+  const master = repeating('FREQ=DAILY');
+  const skipped = toLocalISO(new Date(2026, 7, 6, 9));
+  const moved: CalendarEvent = {
+    ...ev('edited', toLocalISO(new Date(2026, 7, 7, 15)), toLocalISO(new Date(2026, 7, 7, 16))),
+    recurrenceId: 'series',
+    originalStart: toLocalISO(new Date(2026, 7, 7, 9)),
+  };
+  const out = expandEvents(
+    [{ ...master, exdates: [skipped] }, moved],
+    new Date(2026, 7, 5),
+    new Date(2026, 7, 9),
+  );
+  assert.deepEqual(
+    out.map((e) => format(parse(e.start), 'd HH:mm')).sort(),
+    ['5 09:00', '7 15:00', '8 09:00'],
+    'the 6th is gone and the 7th shows only its edited copy',
+  );
+  ok('exceptions replace the occurrences they stand for');
+}
+{
+  // An occurrence has no row of its own, so the editor rebuilds it from its id.
+  const master = repeating('FREQ=WEEKLY');
+  const wanted = toLocalISO(new Date(2026, 7, 19, 9));
+  const found = resolveEvent([master], occurrenceId('series', wanted));
+  assert.equal(found?.start, wanted);
+  assert.equal(found?.recurrenceId, 'series');
+  assert.equal(format(parse(found!.end), 'HH:mm'), '10:00', 'the occurrence keeps the length');
+  assert.equal(resolveEvent([{ ...master, exdates: [wanted] }], occurrenceId('series', wanted)), null);
+  ok('an occurrence id round-trips back into an event');
+}
+{
+  const master = repeating('FREQ=WEEKLY');
+  const next = nextOccurrence(master, new Date(2026, 7, 20));
+  assert.equal(format(parse(next!.start), 'MMM d'), 'Aug 26', 'the next one after the 20th');
+  ok('search can find the occurrence that is coming up');
+}
+{
+  // Splitting for "this and following": the first half keeps what it had.
+  const master = repeating('FREQ=DAILY;COUNT=5');
+  const head = ruleEndingBefore(master, parseRule(master.recurrence)!, new Date(2026, 7, 8));
+  assert.equal(head?.kept, 3, 'the 5th, 6th and 7th stay behind');
+  assert.equal(formatRule(head!.rule), 'FREQ=DAILY;COUNT=3');
+  const openEnded = repeating('FREQ=DAILY');
+  const cut = ruleEndingBefore(openEnded, parseRule(openEnded.recurrence)!, new Date(2026, 7, 8));
+  assert.equal(formatRule(cut!.rule), 'FREQ=DAILY;UNTIL=20260807');
+  ok('a series splits into two rules that do not overlap');
+}
+{
+  // An open-ended daily rule drawn far in the future must not walk every day
+  // between here and there.
+  const started = performance.now();
+  const out = expandEvents([repeating('FREQ=DAILY')], new Date(2126, 0, 1), new Date(2126, 0, 8));
+  assert.equal(out.length, 7);
+  assert.ok(performance.now() - started < 50, 'expansion should skip ahead, not iterate');
+  ok('a century-long series expands in constant time');
+}
+
+console.log('\nediting a series');
+{
+  // The store persists through localStorage, which node has no notion of. The
+  // import has to come after the shim, so it is a dynamic one.
+  (globalThis as unknown as { localStorage: Storage }).localStorage = {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+    clear: () => {},
+    key: () => null,
+    length: 0,
+  };
+  const { useStore } = await import('../store');
+
+  const week = { from: new Date(2026, 7, 1), to: new Date(2026, 8, 1) };
+  /** 7am on a day in August 2026, the wall time the series is anchored on. */
+  const morning = (dayOfMonth: number, hour = 7) => toLocalISO(new Date(2026, 7, dayOfMonth, hour));
+  const startAugust = (rrule: string) => {
+    useStore.setState({ events: [] });
+    return useStore.getState().createEvent({
+      title: 'Gym',
+      start: at(7),
+      end: at(8),
+      allDay: false,
+      calendarId: 'personal',
+      recurrence: rrule,
+    });
+  };
+  const dates = () =>
+    expandEvents(useStore.getState().events, week.from, week.to)
+      .map((e) => format(parse(e.start), 'd HH:mm'))
+      .sort((a, b) => Number(a.split(' ')[0]) - Number(b.split(' ')[0]));
+
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    assert.deepEqual(dates(), ['5 07:00', '12 07:00', '19 07:00', '26 07:00']);
+
+    // "This event" only: the 12th goes, the rest of the series does not.
+    useStore.getState().deleteEventScoped(occurrenceId(master.id, morning(12)), 'this');
+    assert.deepEqual(dates(), ['5 07:00', '19 07:00', '26 07:00']);
+    assert.equal(useStore.getState().events.length, 1, 'still one stored row');
+    ok('deleting one occurrence leaves the series standing');
+  }
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    const twelfth = occurrenceId(master.id, morning(12));
+    useStore.getState().updateEventScoped(
+      twelfth,
+      { start: toLocalISO(new Date(2026, 7, 12, 18)), end: toLocalISO(new Date(2026, 7, 12, 19)) },
+      'this',
+    );
+    assert.deepEqual(dates(), ['5 07:00', '12 18:00', '19 07:00', '26 07:00']);
+    assert.equal(useStore.getState().events.length, 2, 'the edit is a second row');
+    ok('moving one occurrence does not move the others');
+  }
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    // "All events" moves the whole series, including the master's own day.
+    useStore.getState().updateEventScoped(
+      occurrenceId(master.id, morning(19)),
+      { start: toLocalISO(new Date(2026, 7, 19, 8)), end: toLocalISO(new Date(2026, 7, 19, 9)) },
+      'all',
+    );
+    assert.deepEqual(dates(), ['5 08:00', '12 08:00', '19 08:00', '26 08:00']);
+    ok('an all-events change reaches back to the ones already past');
+  }
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    // Dragged to Thursday for good: the rule has to follow the event.
+    useStore.getState().updateEventScoped(
+      occurrenceId(master.id, morning(19)),
+      { start: toLocalISO(new Date(2026, 7, 20, 7)), end: toLocalISO(new Date(2026, 7, 20, 8)) },
+      'following',
+    );
+    assert.deepEqual(dates(), ['5 07:00', '12 07:00', '20 07:00', '27 07:00']);
+    assert.equal(useStore.getState().events.length, 2, 'the series split in two');
+    const [head, tail] = useStore.getState().events;
+    assert.equal(head.recurrence, 'FREQ=WEEKLY;BYDAY=WE;UNTIL=20260818');
+    assert.equal(tail.recurrence, 'FREQ=WEEKLY;BYDAY=TH', 'the new half repeats on its new day');
+    ok('"this and following" splits the series and carries the weekday over');
+  }
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    useStore.getState().updateEventScoped(occurrenceId(master.id, morning(5)), { title: 'Swim' }, 'all');
+    assert.equal(useStore.getState().events[0].title, 'Swim');
+    assert.equal(dates().length, 4, 'editing the title does not disturb the dates');
+
+    useStore.getState().deleteEventScoped(occurrenceId(master.id, morning(19)), 'all');
+    assert.deepEqual(useStore.getState().events, [], 'the whole series is gone');
+    ok('the series can still be edited and deleted as a whole');
+  }
+  {
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    // Turning repetition off collapses the series back to a single event.
+    useStore.getState().updateEventScoped(occurrenceId(master.id, morning(5)), { recurrence: undefined }, 'all');
+    assert.deepEqual(dates(), ['5 07:00']);
+    ok('clearing the rule leaves one ordinary event behind');
+  }
 }
 
 console.log('\ngeocode');

@@ -40,7 +40,13 @@ export interface EventRow {
   starts_at: string;
   ends_at: string;
   all_day: boolean;
+  /** RRULE on a series master; null on everything else. */
   recurrence: string | null;
+  /** Occurrence starts removed from the series, as local-offset ISO strings. */
+  exdates: string[] | null;
+  /** Set on an event that replaces a single occurrence of `recurrence_id`. */
+  recurrence_id: string | null;
+  original_start: string | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;

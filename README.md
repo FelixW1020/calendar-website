@@ -19,6 +19,24 @@ into the dialog on first load, or click **Key** in the assistant panel.
 **Views** — day, week, month. Click an empty slot to create an event, drag to
 move it, drag its bottom edge to resize. Click an event to edit or delete it.
 
+**Repeating events** — the **Repeat** field in the editor offers daily, weekly
+on this day, every weekday, monthly on the nth weekday, annually, and a custom
+rule: every N days/weeks/months/years, which weekdays, and an end (never, on a
+date, or after N times). A repeating event is stored once, as a rule, and drawn
+wherever the rule lands — "every weekday, forever" is one row, not a thousand.
+
+Editing or deleting one of them asks what you meant, the way a calendar has to:
+**this event**, **this and following events**, or **all events**. Changing one
+occurrence leaves a stand-in behind that the rule no longer covers; changing all
+of them moves the series, stand-ins included; changing this and the following
+ones splits the series in two at that point. Dragging an occurrence in the grid
+asks the same question on drop. Deleting one occurrence punches a hole and
+leaves the rest alone.
+
+Occurrences have no rows of their own, so they are identified by the series they
+came from plus the moment they land on — which is what makes "just this one"
+possible without writing out the rest.
+
 **Locations** — every event has a location field, separate from the title. The
 assistant fills it in on its own: "lunch at Blue Bottle" becomes *Lunch* located
 at *Blue Bottle*, "standup in room 302" becomes *Standup* at *Room 302*. It
@@ -103,7 +121,9 @@ press has to stay available for scrolling.
 - `lunch with Priya Thursday at 1` → 1:00–2:00pm Thursday
 - `block 9-11 tomorrow for deep work`
 - `flight to Boston Mar 4, 6:45am, confirmation XR4B9 in the notes`
+- `gym every Monday and Wednesday at 7am` — one repeating event, not a pile of copies
 - `move my dentist appointment to Friday`
+- `skip gym tomorrow` / `gym is at 8 from now on` — the same three scopes, chosen from what you said
 - `what do I have on Tuesday?` — reads back, creates nothing
 - `cancel the 3pm` — asks you to confirm first
 
@@ -112,9 +132,9 @@ It runs on tool use, not text parsing: the model is given `create_event`,
 with schema-validated arguments. That's what makes "move my dentist appointment"
 work — it can search the calendar before it writes to it.
 
-Ambiguous requests get a clarifying question rather than a guess. Deletions, and
-moves to a different day, pause for a yes/no in the chat panel before they
-happen.
+Ambiguous requests get a clarifying question rather than a guess. Deletions,
+moves to a different day, and any change that reaches past the one occurrence
+you asked about pause for a yes/no in the chat panel before they happen.
 
 ---
 
@@ -207,28 +227,32 @@ src/
     assistant.ts     Claude integration — tools, prompt, tool runner, errors
     dates.ts         Range math, local-ISO serialization, formatting
     layout.ts        Overlapping-event column packing
+    recurrence.ts    Repeat rules: parsing, expansion, exceptions, splitting
     geocode.ts       Place search, confident-match resolve, map + maps links
     sync.ts          Supabase merge, write queue, realtime subscription
-    smoke.test.ts    Checks for dates, layout, and geocode links
+    smoke.test.ts    Checks for dates, layout, recurrence, and geocode links
   components/
     TimeGrid.tsx        Day + week grid, drag/resize, current-time line
     MonthView.tsx       Month grid with "+N more"
     ChatPanel.tsx       Assistant UI and confirmation gate
     EventEditor.tsx     Event detail / edit dialog
+    RecurrenceField.tsx Repeat picker, presets and custom rule
+    ScopeDialog.tsx     "This event / following / all" for a series
     LocationField.tsx   Location combobox, suggestions, map card
     Header.tsx          Navigation, search, view switcher, theme
     Sidebar.tsx         Mini month, calendar list, shortcuts
   store.ts           Zustand state, persisted to localStorage
 ```
 
-`npm run smoke` runs the date, layout and link checks; `npm run typecheck` and
+`npm run smoke` runs the date, layout, recurrence and link checks; `npm run typecheck` and
 `npm run build` cover the rest. There is no backend and nothing at build time
 needs a secret.
 
 **Typing stays local.** The editor holds an event in local state while it is
 open and writes through on a 300ms trailing debounce, so a keystroke costs one
 small re-render instead of a grid re-layout, a full `localStorage` rewrite and a
-network upsert. `localStorage` writes are batched behind the same idea, and are
+network upsert. An occurrence of a repeating event cannot write through at all
+until the scope question is answered, so that dialog holds its edits until Save. `localStorage` writes are batched behind the same idea, and are
 flushed when the tab is hidden or closed so nothing typed is lost.
 
 Events are stored as ISO 8601 with a local offset (`2026-08-05T13:05:00-05:00`)
@@ -252,6 +276,7 @@ date arithmetic starts slipping.
 
 ## Not built yet
 
-Recurring events (asking for one creates the next few concrete occurrences
-instead — the `recurrence` field is reserved on the event model), Google/CalDAV
-sync, ICS import/export, reminders, and sharing. Single timezone only.
+Google/CalDAV sync, ICS import/export, reminders, and sharing. Single timezone
+only. Repeat rules cover the common shapes (see **Repeating events** above) but
+not the whole of RFC 5545 — no BYSETPOS, BYWEEKNO, or several rules on one
+event.

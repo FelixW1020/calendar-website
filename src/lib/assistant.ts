@@ -5,6 +5,14 @@ import { addMinutes, format } from 'date-fns';
 import type { Calendar, CalendarEvent, ChatImage } from '../types';
 import type { NewEvent } from '../store';
 import { localTimeZone, parse, toLocalISO } from './dates';
+import {
+  describeEvent,
+  expandEvents,
+  nextOccurrence,
+  parseRule,
+  resolveEvent,
+  type SeriesScope,
+} from './recurrence';
 
 export const MODEL = 'claude-opus-5';
 
@@ -28,8 +36,9 @@ export interface AssistantDeps {
   getEvents: () => CalendarEvent[];
   getCalendars: () => Calendar[];
   createEvent: (e: NewEvent) => CalendarEvent;
-  updateEvent: (id: string, patch: Partial<NewEvent>) => CalendarEvent | null;
-  deleteEvent: (id: string) => CalendarEvent | null;
+  /** `id` may name a single occurrence; `scope` says how far the edit reaches. */
+  updateEvent: (id: string, patch: Partial<NewEvent>, scope: SeriesScope) => CalendarEvent | null;
+  deleteEvent: (id: string, scope: SeriesScope) => CalendarEvent | null;
   /** Resolves true if the user approved a destructive action. */
   confirm: (prompt: string) => Promise<boolean>;
   /** Called with a human-readable line for each tool the model runs. */
@@ -123,10 +132,24 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     'means the next time it comes around. If part of it is unreadable or missing,',
     'say so rather than filling it in.',
     '',
-    '## Recurrence',
-    'Recurring events are not supported yet. If asked for one, create the next few',
-    'concrete occurrences (at most 8, and say how many you made) rather than',
-    'refusing outright.',
+    '## Repeating events',
+    'A repeating event is one event with a rule, never a pile of copies. Set',
+    '`recurrence` to an RFC 5545 RRULE body — no "RRULE:" prefix, no DTSTART:',
+    '  "gym every Monday and Wednesday at 7am" → FREQ=WEEKLY;BYDAY=MO,WE',
+    '  "standup every weekday"                 → FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR',
+    '  "rent on the 1st"                       → FREQ=MONTHLY;BYMONTHDAY=1',
+    '  "team lunch the 2nd Tuesday"            → FREQ=MONTHLY;BYDAY=2TU',
+    '  "every other Friday for 10 weeks"       → FREQ=WEEKLY;INTERVAL=2;BYDAY=FR;COUNT=5',
+    '  "daily until Sep 1"                     → FREQ=DAILY;UNTIL=20260901',
+    'The supported parts are FREQ (DAILY/WEEKLY/MONTHLY/YEARLY), INTERVAL, BYDAY,',
+    'BYMONTHDAY, COUNT and UNTIL (a plain YYYYMMDD date, inclusive). `start` is',
+    'the first occurrence, so it must fall on a day the rule allows.',
+    '',
+    'Editing or deleting a repeating event needs a `scope`, and picking the wrong',
+    'one is destructive, so read the request: "cancel gym tomorrow" is "this",',
+    '"gym is at 8 from now on" is "following", "gym is always at 8" or "stop going',
+    'to gym" is "all". When it is genuinely unclear, ask. Ids from list_events',
+    'name one occurrence, which is what makes "this" possible — use them as given.',
     '',
     '## Answering',
     'When the user asks what is on their schedule, read it back and create nothing.',
@@ -159,6 +182,7 @@ function volatileContext(calendars: Calendar[]): string {
 
 function summarize(ev: CalendarEvent, calendars: Calendar[]) {
   const cal = calendars.find((c) => c.id === ev.calendarId);
+  const repeats = describeEvent(ev);
   return {
     id: ev.id,
     title: ev.title,
@@ -168,7 +192,14 @@ function summarize(ev: CalendarEvent, calendars: Calendar[]) {
     calendar: cal?.name ?? ev.calendarId,
     ...(ev.location ? { location: ev.location } : {}),
     ...(ev.description ? { description: ev.description } : {}),
+    // Present on every occurrence of a series, so the model can see that an id
+    // it is about to change belongs to one.
+    ...(repeats ? { repeats, recurrence: ev.recurrence } : {}),
   };
+}
+
+function scopeOf(value: string | undefined): SeriesScope {
+  return value === 'this' || value === 'following' ? value : 'all';
 }
 
 function resolveCalendarId(calendars: Calendar[], wanted?: string): string {
@@ -225,8 +256,10 @@ function buildTools(deps: AssistantDeps) {
     run: async ({ start_date, end_date }) => {
       const from = parseModelDate(start_date);
       const to = parseModelDate(end_date, true);
-      const hits = deps
-        .getEvents()
+      // Repeating events are expanded here, so what the model sees over a range
+      // is what the user sees on the grid — one entry per occurrence, each with
+      // an id that can be edited on its own.
+      const hits = expandEvents(deps.getEvents(), from, to)
         .filter((ev) => parse(ev.start) <= to && parse(ev.end) >= from)
         .sort((a, b) => a.start.localeCompare(b.start));
       deps.onAction(`Read ${start_date} → ${end_date} (${hits.length} event${hits.length === 1 ? '' : 's'})`);
@@ -252,8 +285,12 @@ function buildTools(deps: AssistantDeps) {
     run: async ({ query, limit }) => {
       const q = query.toLowerCase().trim();
       const terms = q.split(/\s+/).filter(Boolean);
+      const now = new Date();
       const scored = deps
         .getEvents()
+        // A series is one row; answer with the occurrence coming up, which is
+        // what "my dentist appointment" almost always means.
+        .map((ev) => (ev.recurrence ? nextOccurrence(ev, now) ?? ev : ev))
         .map((ev) => {
           const hay = `${ev.title} ${ev.location ?? ''} ${ev.description ?? ''}`.toLowerCase();
           const score = terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
@@ -286,6 +323,13 @@ function buildTools(deps: AssistantDeps) {
           type: 'integer',
           description: 'Alternative to end. Ignored when end is given.',
         },
+        recurrence: {
+          type: 'string',
+          description:
+            'Makes this a repeating event. An RRULE body such as ' +
+            '"FREQ=WEEKLY;BYDAY=MO,WE" or "FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12". ' +
+            'start is the first occurrence. Omit for a one-off.',
+        },
       },
       required: ['title', 'start'],
       additionalProperties: false,
@@ -305,6 +349,15 @@ function buildTools(deps: AssistantDeps) {
       }
       if (end <= start) end = addMinutes(start, allDay ? 24 * 60 : 60);
 
+      if (args.recurrence && !parseRule(args.recurrence)) {
+        return JSON.stringify({
+          error:
+            `"${args.recurrence}" is not a rule I can read. Use FREQ with ` +
+            'DAILY, WEEKLY, MONTHLY or YEARLY, optionally with INTERVAL, BYDAY, ' +
+            'BYMONTHDAY, COUNT or UNTIL=YYYYMMDD.',
+        });
+      }
+
       const ev = deps.createEvent({
         title: args.title,
         start: toLocalISO(start),
@@ -313,8 +366,12 @@ function buildTools(deps: AssistantDeps) {
         description: args.description,
         location: args.location,
         calendarId: resolveCalendarId(cals(), args.calendar),
+        recurrence: args.recurrence || undefined,
       });
-      deps.onAction(`Added "${ev.title}" — ${prettyWhen(ev)}`);
+      const repeats = describeEvent(ev);
+      deps.onAction(
+        `Added "${ev.title}" — ${prettyWhen(ev)}${repeats ? `, ${repeats.toLowerCase()}` : ''}`,
+      );
       deps.onEventTouched(ev);
       return JSON.stringify({ created: summarize(ev, cals()) });
     },
@@ -336,19 +393,40 @@ function buildTools(deps: AssistantDeps) {
         description: { type: 'string' },
         location: { type: 'string' },
         calendar: { type: 'string' },
+        recurrence: {
+          type: 'string',
+          description:
+            'A new repeat rule (RRULE body), or an empty string to stop it ' +
+            'repeating. Changing this always applies to the whole series.',
+        },
+        scope: {
+          type: 'string',
+          enum: ['this', 'following', 'all'],
+          description:
+            'Required for a repeating event: whether the change is to this one ' +
+            'occurrence, this and every later one, or the entire series.',
+        },
       },
       required: ['id'],
       additionalProperties: false,
     },
     run: async (args) => {
-      const existing = deps.getEvents().find((e) => e.id === args.id);
+      const existing = resolveEvent(deps.getEvents(), args.id);
       if (!existing) {
         return JSON.stringify({
           error: `No event with id ${args.id}. Call find_events to get a current id.`,
         });
       }
+      const scope = scopeOf(args.scope);
+      const repeats = Boolean(describeEvent(existing));
 
       const patch: Partial<NewEvent> = {};
+      if (args.recurrence !== undefined) {
+        if (args.recurrence && !parseRule(args.recurrence)) {
+          return JSON.stringify({ error: `"${args.recurrence}" is not a rule I can read.` });
+        }
+        patch.recurrence = args.recurrence || undefined;
+      }
       if (args.title !== undefined) patch.title = args.title;
       if (args.description !== undefined) patch.description = args.description;
       if (args.location !== undefined) {
@@ -377,23 +455,31 @@ function buildTools(deps: AssistantDeps) {
       }
 
       // Confirmation gate: silent edits are fine, but moving an event to a
-      // different day is the kind of thing the user wants to see first.
+      // different day is the kind of thing the user wants to see first — and so
+      // is any edit that reaches past the one occurrence that was asked about.
       const movesDay =
         patch.start !== undefined && format(newStart, 'yyyy-MM-dd') !== format(parse(existing.start), 'yyyy-MM-dd');
-      if (movesDay) {
-        const ok = await deps.confirm(
-          `Move "${existing.title}" from ${prettyWhen(existing)} to ${format(newStart, "EEE MMM d 'at' h:mm a")}?`,
-        );
+      const reachesOthers = repeats && scope !== 'this';
+      if (movesDay || reachesOthers) {
+        const what = movesDay
+          ? `Move "${existing.title}" from ${prettyWhen(existing)} to ${format(newStart, "EEE MMM d 'at' h:mm a")}`
+          : `Change "${existing.title}"`;
+        const which = reachesOthers
+          ? scope === 'all'
+            ? ' — every occurrence of this repeating event'
+            : ' — this and every later occurrence'
+          : '';
+        const ok = await deps.confirm(`${what}${which}?`);
         if (!ok) {
-          deps.onAction(`Move of "${existing.title}" declined`);
+          deps.onAction(`Change to "${existing.title}" declined`);
           return JSON.stringify({
             cancelled: true,
-            reason: 'The user declined this move. Do not retry it; ask what they want instead.',
+            reason: 'The user declined this change. Do not retry it; ask what they want instead.',
           });
         }
       }
 
-      const updated = deps.updateEvent(args.id, patch);
+      const updated = deps.updateEvent(args.id, patch, scope);
       if (!updated) return JSON.stringify({ error: 'Update failed; the event no longer exists.' });
       deps.onAction(`Updated "${updated.title}" — ${prettyWhen(updated)}`);
       deps.onEventTouched(updated);
@@ -408,18 +494,38 @@ function buildTools(deps: AssistantDeps) {
       'effect. Get the id from find_events or list_events first.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string' } },
+      properties: {
+        id: { type: 'string' },
+        scope: {
+          type: 'string',
+          enum: ['this', 'following', 'all'],
+          description:
+            'Required for a repeating event: whether to remove this one ' +
+            'occurrence, this and every later one, or the entire series.',
+        },
+      },
       required: ['id'],
       additionalProperties: false,
     },
-    run: async ({ id }) => {
-      const existing = deps.getEvents().find((e) => e.id === id);
+    run: async ({ id, scope: wanted }) => {
+      const existing = resolveEvent(deps.getEvents(), id);
       if (!existing) {
         return JSON.stringify({
           error: `No event with id ${id}. Call find_events to get a current id.`,
         });
       }
-      const ok = await deps.confirm(`Delete "${existing.title}" on ${prettyWhen(existing)}?`);
+      const scope = scopeOf(wanted);
+      const repeats = Boolean(describeEvent(existing));
+      const which = !repeats
+        ? ''
+        : scope === 'all'
+          ? ' and every other occurrence of it'
+          : scope === 'following'
+            ? ' and every later occurrence of it'
+            : ' (this occurrence only)';
+      const ok = await deps.confirm(
+        `Delete "${existing.title}" on ${prettyWhen(existing)}${which}?`,
+      );
       if (!ok) {
         deps.onAction(`Deletion of "${existing.title}" declined`);
         return JSON.stringify({
@@ -427,9 +533,9 @@ function buildTools(deps: AssistantDeps) {
           reason: 'The user declined this deletion. Do not retry it; the event still exists.',
         });
       }
-      deps.deleteEvent(id);
-      deps.onAction(`Deleted "${existing.title}"`);
-      return JSON.stringify({ deleted: { id, title: existing.title } });
+      deps.deleteEvent(id, scope);
+      deps.onAction(`Deleted "${existing.title}"${repeats && scope !== 'this' ? ' and its repeats' : ''}`);
+      return JSON.stringify({ deleted: { id, title: existing.title, scope } });
     },
   });
 
