@@ -5,9 +5,19 @@ import type { Place } from '../types';
  *
  * Both providers are OpenStreetMap-based, keyless and CORS-open, so the app
  * keeps its "clone it and it runs" property — no billing account, nothing to
- * put in .env. Photon is built for type-ahead and answers partial words;
- * Nominatim is the fallback because it is the more literal address matcher
- * (and stays up when Photon does not).
+ * put in .env.
+ *
+ * Photon answers everything typed into the field: it is built and hosted for
+ * type-ahead, and the OSM Foundation's policy is explicit that Nominatim is
+ * not to be used that way. Nominatim appears once, as a second opinion for the
+ * single background lookup that runs when an event is opened.
+ *
+ * Two things do the real work of keeping results honest. Queries go out with
+ * street types spelled out, because Photon indexes "Road" and cannot see
+ * through "Rd" — that alone is the difference between finding Hotz Road and
+ * being offered 3rd Avenue in New York. And every result is checked against
+ * the typed text before it is shown, because a geocoder would always rather
+ * return something than nothing.
  */
 
 const PHOTON = 'https://photon.komoot.io/api/';
@@ -20,6 +30,14 @@ export interface Suggestion extends Place {
   detail: string;
   /** Distinguishes a place already used in your calendar from a search hit. */
   source: 'recent' | 'search';
+  /**
+   * The building number the provider actually has, when it has one. Kept
+   * structured rather than read back out of the label, so "302" is not
+   * mistaken for a match against "3025 Main Street".
+   */
+  houseNumber?: string;
+  /** The pin is the street, not the building — the number is not mapped. */
+  approximate?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -108,6 +126,7 @@ function fromPhoton(feature: {
     detail,
     label: joinParts([name, detail]),
     source: 'search',
+    houseNumber: p.housenumber,
   };
 }
 
@@ -127,7 +146,18 @@ async function searchPhoton(query: string, signal: AbortSignal): Promise<Suggest
   return (body.features ?? []).map(fromPhoton).filter((s): s is Suggestion => s !== null);
 }
 
+// Nominatim's usage policy allows one request a second. The debounce and the
+// cache already collapse most typing, but a fast typist can still outrun it.
+let nominatimFreeAt = 0;
+
 async function searchNominatim(query: string, signal: AbortSignal): Promise<Suggestion[]> {
+  const wait = nominatimFreeAt - Date.now();
+  if (wait > 0) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+  }
+  nominatimFreeAt = Date.now() + 1_100;
+
   const url = new URL(NOMINATIM);
   url.searchParams.set('q', query);
   url.searchParams.set('format', 'jsonv2');
@@ -141,6 +171,7 @@ async function searchNominatim(query: string, signal: AbortSignal): Promise<Sugg
     lon: string;
     name?: string;
     display_name: string;
+    address?: { house_number?: string };
   }[];
 
   const out: Suggestion[] = [];
@@ -151,9 +182,129 @@ async function searchNominatim(query: string, signal: AbortSignal): Promise<Sugg
     const parts = r.display_name.split(',').map((s) => s.trim());
     const name = r.name?.trim() || parts[0];
     const detail = joinParts(parts.filter((p) => p.toLowerCase() !== name.toLowerCase()));
-    out.push({ lat, lon, name, detail, label: joinParts([name, detail]), source: 'search' });
+    out.push({
+      lat,
+      lon,
+      name,
+      detail,
+      label: joinParts([name, detail]),
+      source: 'search',
+      houseNumber: r.address?.house_number,
+    });
   }
   return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Matching                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Nobody types "Road" or "Northwest". Both sides of a comparison are expanded
+ * to the long form so "rd" matches "Road" and "n" matches "North".
+ */
+const ABBREVIATIONS: Record<string, string> = {
+  rd: 'road',
+  st: 'street',
+  str: 'street',
+  ave: 'avenue',
+  av: 'avenue',
+  dr: 'drive',
+  ln: 'lane',
+  blvd: 'boulevard',
+  ct: 'court',
+  pl: 'place',
+  ter: 'terrace',
+  cir: 'circle',
+  hwy: 'highway',
+  pkwy: 'parkway',
+  sq: 'square',
+  mt: 'mount',
+  ft: 'fort',
+  n: 'north',
+  s: 'south',
+  e: 'east',
+  w: 'west',
+  ne: 'northeast',
+  nw: 'northwest',
+  se: 'southeast',
+  sw: 'southwest',
+};
+
+export function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .map((t) => ABBREVIATIONS[t] ?? t);
+}
+
+/**
+ * Send the long form to the geocoder, not what was typed. This single change
+ * is most of the accuracy: asked for "6 hotz rd" Photon offers 3rd Avenue in
+ * New York, while "6 hotz road" finds the Hotz Roads — it indexes the spelled
+ * out street type and cannot see through the abbreviation.
+ */
+export function expandQuery(query: string): string {
+  return query
+    .split(/([^A-Za-z0-9]+)/)
+    .map((part) => ABBREVIATIONS[part.toLowerCase()] ?? part)
+    .join('');
+}
+
+/**
+ * Does this result actually answer what was typed?
+ *
+ * This is the guard that matters. Geocoders would rather return something than
+ * nothing — a search for "6 hotz rd, lin" came back with Lincolnshire
+ * postcodes, none of them on any road called Hotz. Showing those is worse than
+ * showing nothing, so every word of the query has to appear in the result.
+ *
+ * Words match by prefix, since the user is mid-type and "chap" is a fair match
+ * for "Chapel". Numbers must match exactly — house number 6 is not 6032 — with
+ * one exception: OpenStreetMap knows most streets but only some of the
+ * buildings on them, so a leading house number is allowed to be missing. That
+ * is reported back, because it makes the pin street-level rather than exact.
+ */
+interface Match {
+  /** The street matched but the building is not in the map data. */
+  approximate: boolean;
+}
+
+export function matchQuery(
+  queryTokens: string[],
+  label: string,
+  /** The result's own building number, if the provider had one. */
+  houseNumber?: string,
+): Match | null {
+  const labelTokens = tokenize(label);
+  const has = (q: string) =>
+    labelTokens.some((l) => (/^\d+$/.test(q) ? l === q : l.startsWith(q)));
+
+  const typedNumber = /^\d+$/.test(queryTokens[0] ?? '') ? queryTokens[0] : null;
+  const rest = typedNumber ? queryTokens.slice(1) : queryTokens;
+
+  // The street, town and anything else typed must all be there.
+  if (rest.length === 0 || !rest.every(has)) return null;
+  if (!typedNumber) return { approximate: false };
+
+  // A result that knows its own number must be the number that was asked for:
+  // 3025 Main Street is not 302 Main Street.
+  if (houseNumber) return houseNumber === typedNumber ? { approximate: false } : null;
+
+  // No number on the result — the street matched and the building is simply
+  // not in the map data, which is the common case outside dense cities.
+  return { approximate: !has(typedNumber) };
+}
+
+/** Re-attach the number the map data is missing, so the text reads as typed. */
+function withHouseNumber(s: Suggestion, houseNumber: string): Suggestion {
+  return {
+    ...s,
+    name: `${houseNumber} ${s.name}`,
+    label: `${houseNumber} ${s.label}`,
+    approximate: true,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -175,9 +326,53 @@ export function cached(query: string): Suggestion[] | undefined {
 }
 
 /**
- * Returns [] rather than throwing when both providers fail: a location field
- * that quietly stops suggesting is a far better outcome than one that breaks
- * the editor because the network is down.
+ * The last word of "6 hotz rd, lin" is a town half-typed. Nominatim matches
+ * literally and returns nothing at all for it, so the query is also tried
+ * without that fragment — the results are still filtered against the full text,
+ * so a town starting with "lin" is what comes back, if one exists.
+ */
+function withoutTrailingFragment(query: string): string | null {
+  const trimmed = query.trim();
+  if (/[,\s]$/.test(query)) return null;
+  const cut = trimmed.replace(/[\s,]*[^\s,]+$/, '').trim();
+  return cut.length >= 3 ? cut.replace(/,$/, '') : null;
+}
+
+function dedupe(results: Suggestion[]): Suggestion[] {
+  const seen = new Set<string>();
+  return results.filter((s) => {
+    // Two providers describing the same doorway agree to about a metre.
+    const key = `${s.lat.toFixed(4)},${s.lon.toFixed(4)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Keep only the results that answer the query, tagging approximate ones. */
+function relevant(raw: Suggestion[], query: string): Suggestion[] {
+  const queryTokens = tokenize(query);
+  const houseNumber = /^\d+$/.test(queryTokens[0] ?? '') ? queryTokens[0] : null;
+
+  const kept: Suggestion[] = [];
+  for (const s of raw) {
+    const match = matchQuery(queryTokens, s.label, s.houseNumber);
+    if (!match) continue;
+    kept.push(match.approximate && houseNumber ? withHouseNumber(s, houseNumber) : s);
+  }
+  // An exact building beats the street it stands on.
+  return dedupe(kept.sort((a, b) => Number(a.approximate ?? false) - Number(b.approximate ?? false)));
+}
+
+/**
+ * Suggestions while typing come from Photon alone. Nominatim is the better
+ * address matcher, but the OSM Foundation's policy is explicit that it must not
+ * be used for autocomplete, and Photon exists precisely for type-ahead — so it
+ * is asked properly (expanded street types) rather than swapped out.
+ *
+ * Returns [] rather than throwing when the lookup fails: a location field that
+ * quietly stops suggesting is a far better outcome than one that breaks the
+ * editor because the network is down.
  */
 export async function searchPlaces(query: string, signal: AbortSignal): Promise<Suggestion[]> {
   const key = query.trim().toLowerCase();
@@ -186,22 +381,32 @@ export async function searchPlaces(query: string, signal: AbortSignal): Promise<
   const hit = cache.get(key);
   if (hit) return hit;
 
-  let results: Suggestion[] = [];
-  try {
-    results = await searchPhoton(query, signal);
-  } catch (err) {
-    if (signal.aborted) throw err;
+  // The last word may be a town half-typed. If the full string finds nothing,
+  // try again without it — results are still filtered against the full text, so
+  // a town starting with "lin" is what comes back, if one exists.
+  const attempts = [query.trim(), withoutTrailingFragment(query)].filter(
+    (a): a is string => a !== null,
+  );
+
+  for (const attempt of attempts) {
+    let raw: Suggestion[];
     try {
-      results = await searchNominatim(query, signal);
-    } catch (fallbackErr) {
-      if (signal.aborted) throw fallbackErr;
-      console.warn('[geocode] both providers failed', fallbackErr);
+      raw = await searchPhoton(expandQuery(attempt), signal);
+    } catch (err) {
+      if (signal.aborted) throw err;
+      console.warn('[geocode] place search failed', err);
       return [];
+    }
+    const matched = relevant(raw, query);
+    if (matched.length > 0) {
+      remember(key, matched);
+      return matched;
     }
   }
 
-  remember(key, results);
-  return results;
+  // Nothing matched — worth caching, so backspacing does not re-ask.
+  remember(key, []);
+  return [];
 }
 
 const MIN_RESOLVE_LENGTH = 4;
@@ -221,26 +426,43 @@ function looksLikePlace(query: string): boolean {
  * or one created before locations carried coordinates.
  *
  * Deliberately strict, because this runs without anyone asking and a wrong pin
- * is worse than no pin: the top hit is accepted only when it accounts for every
- * meaningful word of the query. That rejects "Room 302" while accepting
- * "1364 Campus Dr Durham". Anything turned down here is still one click away
- * in the suggestion list.
+ * is worse than no pin. `searchPlaces` has already discarded anything that does
+ * not match the text; what is added here is that the text must be specific
+ * enough to be worth matching at all, and that the answer must be unambiguous —
+ * three Hotz Roads and no way to tell which is meant is a decision for the
+ * person, not for a background lookup.
  */
 export async function resolvePlace(query: string, signal: AbortSignal): Promise<Place | null> {
   const q = query.trim();
   if (q.length < MIN_RESOLVE_LENGTH || isMeetingLink(q) || !looksLikePlace(q)) return null;
 
-  const [top] = await searchPlaces(q, signal);
+  // One lookup when an event is opened is not autocomplete, so Nominatim — the
+  // stronger address matcher — is fair game here as a second opinion.
+  let found = await searchPlaces(q, signal);
+  if (found.length === 0) {
+    try {
+      found = relevant(await searchNominatim(expandQuery(q), signal), q);
+    } catch (err) {
+      if (signal.aborted) throw err;
+      return null;
+    }
+  }
+
+  const [top, next] = found;
   if (!top) return null;
 
-  const haystack = top.label.toLowerCase();
-  const words = q
-    .toLowerCase()
-    .split(/[^a-z0-9]+/i)
-    .filter((w) => w.length > 2 || /^\d+$/.test(w));
-  if (words.length === 0 || !words.every((w) => haystack.includes(w))) return null;
+  // Several hits are fine when they are all the same corner of the world — two
+  // providers describing one building, or a campus listed twice. Hits that
+  // disagree about which state they are in mean the text was not specific
+  // enough to pin unattended: "Duke Chapel" exists in NC and in Tennessee.
+  if (next && !roughlyTheSameArea(top, next)) return null;
 
   return { lat: top.lat, lon: top.lon, label: top.label };
+}
+
+/** Within about half a degree — same town, or near enough for a map card. */
+function roughlyTheSameArea(a: Place, b: Place): boolean {
+  return Math.abs(a.lat - b.lat) < 0.5 && Math.abs(a.lon - b.lon) < 0.5;
 }
 
 /* -------------------------------------------------------------------------- */

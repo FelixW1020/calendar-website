@@ -67,6 +67,9 @@ export default function LocationField({ value, place, onChange, className }: Pro
   const [results, setResults] = useState<Suggestion[]>([]);
   const [busy, setBusy] = useState(false);
   const [active, setActive] = useState(0);
+  // The last query a search actually finished for, so "no matches" is only ever
+  // shown about the text currently in the box.
+  const [searched, setSearched] = useState<string | null>(null);
 
   const inputRef = useRef<HTMLInputElement>(null);
   // A pick writes the label straight into the field; without this the effect
@@ -99,6 +102,7 @@ export default function LocationField({ value, place, onChange, className }: Pro
     const hit = cached(q);
     if (hit) {
       setResults(hit);
+      setSearched(q);
       setBusy(false);
       return;
     }
@@ -109,6 +113,7 @@ export default function LocationField({ value, place, onChange, className }: Pro
       searchPlaces(q, controller.signal)
         .then((found) => {
           setResults(found);
+          setSearched(q);
           setActive(0);
         })
         .catch(() => {
@@ -189,7 +194,9 @@ export default function LocationField({ value, place, onChange, className }: Pro
     }
   };
 
-  const showList = open && (suggestions.length > 0 || busy);
+  // Silence after typing an address reads as a broken field. Say so instead.
+  const noMatch = !busy && searched === value.trim() && suggestions.length === 0;
+  const showList = open && (suggestions.length > 0 || busy || noMatch);
 
   return (
     <div>
@@ -290,7 +297,14 @@ export default function LocationField({ value, place, onChange, className }: Pro
                     }
                   />
                   <span className="min-w-0">
-                    <span className="block truncate text-sm text-ink">{s.name}</span>
+                    <span className="block truncate text-sm text-ink">
+                      {s.name}
+                      {s.approximate && (
+                        <span className="ml-1.5 text-[10px] uppercase tracking-wider text-ink-faint">
+                          approx.
+                        </span>
+                      )}
+                    </span>
                     {s.detail && (
                       <span className="block truncate text-[11px] text-ink-faint">{s.detail}</span>
                     )}
@@ -300,6 +314,11 @@ export default function LocationField({ value, place, onChange, className }: Pro
             ))}
             {busy && suggestions.length === 0 && (
               <li className="px-2 py-1.5 text-sm text-ink-faint">Searching…</li>
+            )}
+            {noMatch && (
+              <li className="px-2 py-1.5 text-sm text-ink-faint">
+                No matching places — the text is saved as you typed it.
+              </li>
             )}
           </ul>
         )}

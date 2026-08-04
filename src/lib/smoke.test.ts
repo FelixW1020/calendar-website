@@ -9,7 +9,15 @@ import {
   formatEventTime,
   eventsOn,
 } from './dates';
-import { directionsUrl, isMeetingLink, mapEmbedUrl, mapsUrl } from './geocode';
+import {
+  directionsUrl,
+  expandQuery,
+  isMeetingLink,
+  mapEmbedUrl,
+  mapsUrl,
+  matchQuery,
+  tokenize,
+} from './geocode';
 import type { CalendarEvent } from '../types';
 
 let n = 0;
@@ -162,6 +170,52 @@ console.log('\ngeocode');
   assert.ok(west < place.lon && east > place.lon, 'marker sits inside the box horizontally');
   assert.ok(south < place.lat && north > place.lat, 'marker sits inside the box vertically');
   ok('the map embed frames its marker');
+}
+
+console.log('\nplace matching');
+{
+  // Photon indexes "Road", not "Rd" — sending the abbreviation is what made
+  // "6 hotz rd" come back as 3rd Avenue, New York.
+  assert.equal(expandQuery('6 hotz rd, lin'), '6 hotz road, lin');
+  assert.equal(expandQuery('1364 Campus Dr'), '1364 Campus drive');
+  assert.equal(expandQuery('100 NW 5th Ave'), '100 northwest 5th avenue');
+  // A word that merely starts with an abbreviation is left alone.
+  assert.equal(expandQuery('Stockholm'), 'Stockholm');
+  ok('street types are spelled out before searching');
+}
+{
+  const m = (q: string, label: string) => matchQuery(tokenize(q), label);
+
+  // The results that started this: neither is on a road called Hotz.
+  assert.equal(m('6 hotz rd', '3rd Avenue, New York, United States'), null);
+  assert.equal(m('6 hotz rd, lin', 'LN6 7RD, Lincoln, England, United Kingdom'), null);
+  ok('results that do not contain what was typed are rejected');
+}
+{
+  const m = (q: string, label: string, houseNumber?: string) =>
+    matchQuery(tokenize(q), label, houseNumber);
+
+  // The street is mapped, the building is not: usable, but street-level.
+  assert.deepEqual(m('6 hotz rd, lin', 'North Hotz Road, Lincolnshire, Illinois, 60069'), {
+    approximate: true,
+  });
+  // The building itself is mapped.
+  assert.deepEqual(
+    m('1364 campus dr, dur', 'West Duke Building, 1364 Campus Drive, Durham, NC', '1364'),
+    { approximate: false },
+  );
+  // A different building on the right street is not "close enough".
+  assert.equal(m('302 main st', '3025 Main Street, Springfield', '3025'), null);
+  ok('a mapped building is told apart from its street, and from its neighbours');
+}
+{
+  const m = (q: string, label: string) => matchQuery(tokenize(q), label);
+
+  // Half-typed words match by prefix; numbers never do.
+  assert.ok(m('duke chap', 'Duke Chapel, 401 Chapel Drive, Durham, NC'));
+  assert.equal(m('room 302', 'Room 30, Some Building'), null);
+  assert.equal(m('durham 27705', 'Durham, NC, 27701, United States'), null);
+  ok('words match by prefix, numbers exactly');
 }
 
 console.log(`\n${n} checks passed\n`);
