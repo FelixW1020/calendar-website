@@ -317,7 +317,12 @@ function buildTools(deps: AssistantDeps) {
       const patch: Partial<NewEvent> = {};
       if (args.title !== undefined) patch.title = args.title;
       if (args.description !== undefined) patch.description = args.description;
-      if (args.location !== undefined) patch.location = args.location;
+      if (args.location !== undefined) {
+        patch.location = args.location;
+        // The old coordinates belong to the old address; the editor re-resolves
+        // the new one when it is next opened.
+        patch.place = undefined;
+      }
       if (args.all_day !== undefined) patch.allDay = args.all_day;
       if (args.calendar !== undefined) patch.calendarId = resolveCalendarId(cals(), args.calendar);
 

@@ -157,7 +157,8 @@ export default function App() {
         </button>
       )}
 
-      {selectedEventId && <EventEditor />}
+      {/* Keyed so each event gets a fresh editor with its own local draft. */}
+      {selectedEventId && <EventEditor key={selectedEventId} />}
       {keyDialog && <ApiKeyDialog onClose={() => setKeyDialog(false)} />}
       {accountOpen && <AccountDialog onClose={() => setAccountOpen(false)} />}
     </div>

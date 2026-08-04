@@ -19,6 +19,10 @@ function rowToEvent(r: EventRow): CalendarEvent {
     title: r.title,
     description: r.description ?? undefined,
     location: r.location ?? undefined,
+    place:
+      r.place_lat != null && r.place_lon != null
+        ? { lat: r.place_lat, lon: r.place_lon, label: r.place_label ?? r.location ?? '' }
+        : undefined,
     start: toLocalISO(new Date(r.starts_at)),
     end: toLocalISO(new Date(r.ends_at)),
     allDay: r.all_day,
@@ -37,6 +41,9 @@ function eventToRow(e: CalendarEvent, userId: string) {
     title: e.title,
     description: e.description ?? null,
     location: e.location ?? null,
+    place_lat: e.place?.lat ?? null,
+    place_lon: e.place?.lon ?? null,
+    place_label: e.place?.label ?? null,
     starts_at: parse(e.start).toISOString(),
     ends_at: parse(e.end).toISOString(),
     all_day: e.allDay,
@@ -155,6 +162,84 @@ async function mergeOnSignIn(uid: string): Promise<void> {
   setSync({ status: 'live', message: null });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Outbound queue                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Edits arrive faster than the network should be asked to keep up with — a
+ * dragged event fires on every pointer move. Changes are therefore coalesced
+ * per row (the last one wins; a delete beats the edit before it) and sent after
+ * a short quiet period.
+ */
+const QUIET_MS = 500;
+/** Never sit on a change longer than this, however busy the user is. */
+const MAX_WAIT_MS = 2_500;
+
+const outbox = new Map<string, LocalChange>();
+let queueTimer: ReturnType<typeof setTimeout> | null = null;
+let oldestQueuedAt = 0;
+
+function keyOf(change: LocalChange): string {
+  switch (change.kind) {
+    case 'event.upsert':
+      return `event:${change.event.id}`;
+    case 'event.delete':
+      return `event:${change.id}`;
+    case 'calendar.upsert':
+      return `calendar:${change.calendar.id}`;
+    case 'calendar.delete':
+      return `calendar:${change.id}`;
+  }
+}
+
+function flushOutbox(): void {
+  if (queueTimer) {
+    clearTimeout(queueTimer);
+    queueTimer = null;
+  }
+  oldestQueuedAt = 0;
+  // Calendars first: an event that names a calendar created in the same batch
+  // should not reach the server ahead of it.
+  const batch = [...outbox.values()].sort(
+    (a, b) => Number(a.kind.startsWith('event')) - Number(b.kind.startsWith('event')),
+  );
+  outbox.clear();
+  for (const change of batch) void push(change);
+}
+
+function enqueue(change: LocalChange): void {
+  outbox.set(keyOf(change), change);
+  const now = Date.now();
+  if (oldestQueuedAt === 0) oldestQueuedAt = now;
+  if (now - oldestQueuedAt >= MAX_WAIT_MS) {
+    flushOutbox();
+    return;
+  }
+  if (queueTimer) clearTimeout(queueTimer);
+  queueTimer = setTimeout(flushOutbox, QUIET_MS);
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushOutbox);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushOutbox();
+  });
+}
+
+/**
+ * Our own writes come back over the realtime channel. Replacing the row we just
+ * sent with an identical copy only costs a re-render, so each push records what
+ * it wrote and the subscription skips the echo.
+ */
+const echoes = new Map<string, string>();
+
+function isEcho(id: string, updatedAt: string | null): boolean {
+  if (!updatedAt || echoes.get(id) !== updatedAt) return false;
+  echoes.delete(id);
+  return true;
+}
+
 /** Write a single local change straight through to the server. */
 async function push(change: LocalChange): Promise<void> {
   if (!supabase || !userId) return;
@@ -162,29 +247,37 @@ async function push(change: LocalChange): Promise<void> {
   try {
     switch (change.kind) {
       case 'event.upsert': {
-        const { error } = await supabase.from('events').upsert(eventToRow(change.event, uid));
+        const row = eventToRow(change.event, uid);
+        echoes.set(row.id, row.updated_at);
+        const { error } = await supabase.from('events').upsert(row);
         if (error) throw error;
         break;
       }
       case 'event.delete': {
         // Tombstone rather than delete, so other devices learn about it.
+        const stamp = new Date().toISOString();
+        echoes.set(change.id, stamp);
         const { error } = await supabase
           .from('events')
-          .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .update({ deleted_at: stamp, updated_at: stamp })
           .eq('user_id', uid)
           .eq('id', change.id);
         if (error) throw error;
         break;
       }
       case 'calendar.upsert': {
-        const { error } = await supabase.from('calendars').upsert(calendarToRow(change.calendar, uid));
+        const row = calendarToRow(change.calendar, uid);
+        echoes.set(row.id, row.updated_at);
+        const { error } = await supabase.from('calendars').upsert(row);
         if (error) throw error;
         break;
       }
       case 'calendar.delete': {
+        const stamp = new Date().toISOString();
+        echoes.set(change.id, stamp);
         const { error } = await supabase
           .from('calendars')
-          .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .update({ deleted_at: stamp, updated_at: stamp })
           .eq('user_id', uid)
           .eq('id', change.id);
         if (error) throw error;
@@ -209,7 +302,7 @@ function subscribe(uid: string): void {
       { event: '*', schema: 'public', table: 'events', filter: `user_id=eq.${uid}` },
       (payload) => {
         const row = payload.new as EventRow | null;
-        if (!row?.id) return;
+        if (!row?.id || isEcho(row.id, row.updated_at)) return;
         useStore
           .getState()
           .applyRemote(
@@ -224,7 +317,7 @@ function subscribe(uid: string): void {
       { event: '*', schema: 'public', table: 'calendars', filter: `user_id=eq.${uid}` },
       (payload) => {
         const row = payload.new as CalendarRow | null;
-        if (!row?.id) return;
+        if (!row?.id || isEcho(row.id, row.updated_at)) return;
         useStore
           .getState()
           .applyRemote(
@@ -256,11 +349,14 @@ async function onSession(session: Session | null): Promise<void> {
 
   if (session?.user) {
     setSync({ email: session.user.email ?? null });
-    onLocalChange((c) => void push(c));
+    onLocalChange(enqueue);
     await mergeOnSignIn(session.user.id);
     subscribe(session.user.id);
   } else {
     onLocalChange(null);
+    // Anything still queued belongs to the account that just left.
+    outbox.clear();
+    echoes.clear();
     channel?.unsubscribe();
     channel = null;
     setSync({ status: 'signed-out', email: null, message: null });

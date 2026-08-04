@@ -1,17 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
-import { calendarColor, useStore } from '../store';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CalendarEvent } from '../types';
+import { calendarColor, useStore, type NewEvent } from '../store';
 import { format, parse, toLocalISO } from '../lib/dates';
 import { Close, Trash } from './Icons';
+import LocationField from './LocationField';
 
 /** ISO-with-offset → the value shape <input type="datetime-local"> expects. */
 function toInput(iso: string, dateOnly = false): string {
   const d = parse(iso);
   return dateOnly ? format(d, 'yyyy-MM-dd') : format(d, "yyyy-MM-dd'T'HH:mm");
-}
-
-/** A meeting link should offer "Join", not a map lookup. */
-function isLink(value: string): boolean {
-  return /^(https?:\/\/|www\.)|\.(zoom\.us|meet\.google\.com|teams\.microsoft\.com)/i.test(value.trim());
 }
 
 function fromInput(value: string, endOfDay = false): string {
@@ -22,8 +19,21 @@ function fromInput(value: string, endOfDay = false): string {
   return toLocalISO(new Date(value));
 }
 
+/**
+ * Everything the editor can change. Held locally while the dialog is open so a
+ * keystroke costs one small re-render — writing to the store on every letter
+ * re-laid-out the whole grid, rewrote localStorage and fired a Supabase upsert,
+ * which is what made typing feel heavy.
+ */
+type Draft = Pick<
+  CalendarEvent,
+  'title' | 'start' | 'end' | 'allDay' | 'calendarId' | 'location' | 'place' | 'description'
+>;
+
+/** Long enough to coalesce a burst of typing, short enough to feel immediate. */
+const COMMIT_MS = 300;
+
 export default function EventEditor() {
-  const id = useStore((s) => s.selectedEventId);
   const event = useStore((s) => s.events.find((e) => e.id === s.selectedEventId));
   const calendars = useStore((s) => s.calendars);
   const updateEvent = useStore((s) => s.updateEvent);
@@ -33,13 +43,65 @@ export default function EventEditor() {
   const titleRef = useRef<HTMLInputElement>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  useEffect(() => {
-    setConfirmDelete(false);
-    if (event?.title === 'New event') {
-      titleRef.current?.focus();
-      titleRef.current?.select();
+  // Mounted with key={selectedEventId}, so this initialiser runs once per event
+  // and never has to be re-seeded.
+  const [draft, setDraft] = useState<Draft>(() => ({
+    title: event?.title ?? '',
+    start: event?.start ?? toLocalISO(new Date()),
+    end: event?.end ?? toLocalISO(new Date()),
+    allDay: event?.allDay ?? false,
+    calendarId: event?.calendarId ?? calendars[0]?.id ?? 'personal',
+    location: event?.location ?? '',
+    place: event?.place,
+    description: event?.description ?? '',
+  }));
+
+  const eventId = event?.id ?? null;
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pending = useRef<Partial<NewEvent>>({});
+
+  const flush = useCallback(() => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
     }
-  }, [id, event?.title]);
+    const patch = pending.current;
+    pending.current = {};
+    if (eventId && Object.keys(patch).length > 0) updateEvent(eventId, patch);
+  }, [eventId, updateEvent]);
+
+  /** Update what is on screen now; write it through on a trailing debounce. */
+  const set = useCallback(
+    (patch: Partial<Draft>, immediate = false) => {
+      setDraft((d) => ({ ...d, ...patch }));
+      pending.current = { ...pending.current, ...patch };
+      if (immediate) {
+        flush();
+        return;
+      }
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(flush, COMMIT_MS);
+    },
+    [flush],
+  );
+
+  // Closing, switching events or navigating away must not drop the last few
+  // characters typed.
+  useEffect(() => {
+    const onHide = () => flush();
+    window.addEventListener('pagehide', onHide);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      flush();
+    };
+  }, [flush]);
+
+  useEffect(() => {
+    if (titleRef.current?.value === 'New event') {
+      titleRef.current.focus();
+      titleRef.current.select();
+    }
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -51,8 +113,7 @@ export default function EventEditor() {
 
   if (!event) return null;
 
-  const color = calendarColor(calendars, event.calendarId);
-  const set = (patch: Parameters<typeof updateEvent>[1]) => updateEvent(event.id, patch);
+  const color = calendarColor(calendars, draft.calendarId);
 
   const field =
     'w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-sm ' +
@@ -64,13 +125,13 @@ export default function EventEditor() {
       <div
         role="dialog"
         aria-label="Edit event"
-        className="fixed left-1/2 top-1/2 z-50 w-[min(26rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-line bg-panel shadow-2xl"
+        className="fixed left-1/2 top-1/2 z-50 max-h-[calc(100dvh-2rem)] w-[min(26rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-line bg-panel shadow-2xl"
       >
         <div className="flex items-start gap-2 border-b border-line p-3">
           <span className="event-chip mt-2 h-3 w-3 shrink-0 rounded-full" style={{ background: color }} />
           <input
             ref={titleRef}
-            value={event.title}
+            value={draft.title}
             onChange={(e) => set({ title: e.target.value })}
             placeholder="Add a title"
             className="min-w-0 flex-1 bg-transparent text-base font-medium text-ink outline-none placeholder:text-ink-faint"
@@ -88,8 +149,8 @@ export default function EventEditor() {
           <label className="flex items-center gap-2 text-sm text-ink-soft">
             <input
               type="checkbox"
-              checked={event.allDay}
-              onChange={(e) => set({ allDay: e.target.checked })}
+              checked={draft.allDay}
+              onChange={(e) => set({ allDay: e.target.checked }, true)}
               className="accent-accent"
             />
             All day
@@ -99,8 +160,8 @@ export default function EventEditor() {
             <div>
               <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Starts</div>
               <input
-                type={event.allDay ? 'date' : 'datetime-local'}
-                value={toInput(event.start, event.allDay)}
+                type={draft.allDay ? 'date' : 'datetime-local'}
+                value={toInput(draft.start, draft.allDay)}
                 onChange={(e) => e.target.value && set({ start: fromInput(e.target.value) })}
                 className={field}
               />
@@ -108,9 +169,9 @@ export default function EventEditor() {
             <div>
               <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Ends</div>
               <input
-                type={event.allDay ? 'date' : 'datetime-local'}
-                value={toInput(event.end, event.allDay)}
-                onChange={(e) => e.target.value && set({ end: fromInput(e.target.value, event.allDay) })}
+                type={draft.allDay ? 'date' : 'datetime-local'}
+                value={toInput(draft.end, draft.allDay)}
+                onChange={(e) => e.target.value && set({ end: fromInput(e.target.value, draft.allDay) })}
                 className={field}
               />
             </div>
@@ -119,8 +180,8 @@ export default function EventEditor() {
           <div>
             <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Calendar</div>
             <select
-              value={event.calendarId}
-              onChange={(e) => set({ calendarId: e.target.value })}
+              value={draft.calendarId}
+              onChange={(e) => set({ calendarId: e.target.value }, true)}
               className={field}
             >
               {calendars.map((c) => (
@@ -131,42 +192,17 @@ export default function EventEditor() {
             </select>
           </div>
 
-          <div>
-            <div className="mb-1 flex items-baseline justify-between">
-              <span className="text-[11px] uppercase tracking-wider text-ink-faint">Location</span>
-              {event.location?.trim() && !isLink(event.location) && (
-                <a
-                  href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(event.location)}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
-                >
-                  Open in Maps
-                </a>
-              )}
-              {event.location && isLink(event.location) && (
-                <a
-                  href={event.location.startsWith('http') ? event.location : `https://${event.location}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
-                >
-                  Join
-                </a>
-              )}
-            </div>
-            <input
-              value={event.location ?? ''}
-              onChange={(e) => set({ location: e.target.value })}
-              placeholder="Place, address, or meeting link"
-              className={field}
-            />
-          </div>
+          <LocationField
+            value={draft.location ?? ''}
+            place={draft.place}
+            onChange={(location, place) => set({ location, place })}
+            className={field}
+          />
 
           <div>
             <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Notes</div>
             <textarea
-              value={event.description ?? ''}
+              value={draft.description ?? ''}
               onChange={(e) => set({ description: e.target.value })}
               rows={3}
               placeholder="Optional"
@@ -181,6 +217,9 @@ export default function EventEditor() {
               <span className="text-ink-soft">Delete this event?</span>
               <button
                 onClick={() => {
+                  // Drop anything queued — it would resurrect the row.
+                  pending.current = {};
+                  if (timer.current) clearTimeout(timer.current);
                   deleteEvent(event.id);
                   select(null);
                 }}

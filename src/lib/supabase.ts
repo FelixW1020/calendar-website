@@ -33,6 +33,10 @@ export interface EventRow {
   title: string;
   description: string | null;
   location: string | null;
+  /** Null until the location is picked from search rather than typed. */
+  place_lat: number | null;
+  place_lon: number | null;
+  place_label: string | null;
   starts_at: string;
   ends_at: string;
   all_day: boolean;
