@@ -5,6 +5,7 @@ import {
   DAY_HEIGHT,
   HOUR_HEIGHT,
   SNAP_MINUTES,
+  addDays,
   addMinutes,
   durationMinutes,
   eventsOn,
@@ -16,13 +17,19 @@ import {
   startOfDay,
   toLocalISO,
 } from '../lib/dates';
+import { expandEvents, isSeriesEvent, resolveEvent, type SeriesScope } from '../lib/recurrence';
 import { layoutDay, type PositionedEvent } from '../lib/layout';
+import { Repeat } from './Icons';
+import ScopeDialog from './ScopeDialog';
 
 interface Props {
   days: Date[];
 }
 
 type Draft = { id: string; start: Date; end: Date } | null;
+
+/** A drag that landed on a repeating event and is waiting on "which ones?". */
+type PendingMove = { id: string; patch: { start: string; end: string } } | null;
 
 type DragState =
   | null
@@ -57,13 +64,24 @@ export default function TimeGrid({ days }: Props) {
   const select = useStore((s) => s.select);
   const createEvent = useStore((s) => s.createEvent);
   const updateEvent = useStore((s) => s.updateEvent);
+  const updateEventScoped = useStore((s) => s.updateEventScoped);
 
-  const shown = useMemo(() => visibleEvents(events, calendars), [events, calendars]);
+  // Repeating events are stored once and expanded over the range on screen.
+  const shown = useMemo(
+    () =>
+      expandEvents(
+        visibleEvents(events, calendars),
+        startOfDay(days[0]),
+        addDays(startOfDay(days[days.length - 1]), 1),
+      ),
+    [events, calendars, days],
+  );
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<DragState>(null);
   const [draft, setDraft] = useState<Draft>(null);
+  const [pendingMove, setPendingMove] = useState<PendingMove>(null);
   const [now, setNow] = useState(() => new Date());
 
   // Set once a press crosses the drag threshold, so pointerup can tell a drag
@@ -97,6 +115,10 @@ export default function TimeGrid({ days }: Props) {
   useEffect(() => {
     if (!drag) return;
 
+    // The pointerup handler needs the last position the drag reached, and state
+    // set during the same gesture has not landed yet.
+    let latest: Draft = null;
+
     const onMove = (e: PointerEvent) => {
       if (!movedRef.current) {
         const far =
@@ -115,22 +137,32 @@ export default function TimeGrid({ days }: Props) {
           Math.min(24 * 60 - drag.lengthMin, snap(slot.minutes - drag.grabOffsetMin)),
         );
         const start = addMinutes(startOfDay(days[slot.dayIndex]), startMin);
-        setDraft({ id: drag.id, start, end: addMinutes(start, drag.lengthMin) });
+        latest = { id: drag.id, start, end: addMinutes(start, drag.lengthMin) };
       } else {
         const endMin = Math.max(drag.startMin + SNAP_MINUTES, Math.min(24 * 60, snap(slot.minutes)));
         const base = startOfDay(drag.day);
-        setDraft({ id: drag.id, start: addMinutes(base, drag.startMin), end: addMinutes(base, endMin) });
+        latest = { id: drag.id, start: addMinutes(base, drag.startMin), end: addMinutes(base, endMin) };
       }
+      setDraft(latest);
     };
 
     const onUp = () => {
-      setDraft((d) => {
-        if (d && movedRef.current) {
-          updateEvent(d.id, { start: toLocalISO(d.start), end: toLocalISO(d.end) });
-        }
-        return null;
-      });
       setDrag(null);
+      if (!latest || !movedRef.current) {
+        setDraft(null);
+        return;
+      }
+      const patch = { start: toLocalISO(latest.start), end: toLocalISO(latest.end) };
+      const target = resolveEvent(useStore.getState().events, latest.id);
+      // Dropping one occurrence of a series says nothing about the others, so
+      // ask before moving anything. The block stays where it was dropped until
+      // the question is answered.
+      if (target && isSeriesEvent(target)) {
+        setPendingMove({ id: latest.id, patch });
+        return;
+      }
+      updateEvent(latest.id, patch);
+      setDraft(null);
     };
 
     window.addEventListener('pointermove', onMove);
@@ -261,9 +293,12 @@ export default function TimeGrid({ days }: Props) {
           {ev.title}
         </div>
         {!short && (
-          <div className="truncate text-[11px] opacity-85">
-            {format(shownStart, 'h:mm a')}
-            {ev.location ? ` · ${ev.location}` : ''}
+          <div className="flex items-center gap-1 text-[11px] opacity-85">
+            {isSeriesEvent(ev) && <Repeat className="h-3 w-3 shrink-0" />}
+            <span className="truncate">
+              {format(shownStart, 'h:mm a')}
+              {ev.location ? ` · ${ev.location}` : ''}
+            </span>
           </div>
         )}
         <div
@@ -312,9 +347,10 @@ export default function TimeGrid({ days }: Props) {
                   key={ev.id}
                   onClick={() => select(ev.id)}
                   style={{ background: calendarColor(calendars, ev.calendarId) }}
-                  className="event-chip block w-full truncate rounded px-1.5 py-0.5 text-left text-xs text-white"
+                  className="event-chip flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-xs text-white"
                 >
-                  {ev.title}
+                  {isSeriesEvent(ev) && <Repeat className="h-3 w-3 shrink-0" />}
+                  <span className="truncate">{ev.title}</span>
                 </button>
               ))}
             </div>
@@ -392,6 +428,23 @@ export default function TimeGrid({ days }: Props) {
           </div>
         </div>
       </div>
+
+      {pendingMove && (
+        <ScopeDialog
+          title="Move repeating event"
+          action="Move"
+          options={['this', 'following', 'all']}
+          onConfirm={(scope: SeriesScope) => {
+            updateEventScoped(pendingMove.id, pendingMove.patch, scope);
+            setPendingMove(null);
+            setDraft(null);
+          }}
+          onCancel={() => {
+            setPendingMove(null);
+            setDraft(null);
+          }}
+        />
+      )}
     </div>
   );
 }

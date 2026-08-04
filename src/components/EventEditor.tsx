@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CalendarEvent } from '../types';
 import { calendarColor, useStore, type NewEvent } from '../store';
 import { format, parse, toLocalISO } from '../lib/dates';
+import { isSeriesEvent, masterOf, resolveEvent, type SeriesScope } from '../lib/recurrence';
 import { Close, Trash } from './Icons';
 import LocationField from './LocationField';
+import RecurrenceField from './RecurrenceField';
+import ScopeDialog from './ScopeDialog';
 
 /** ISO-with-offset → the value shape <input type="datetime-local"> expects. */
 function toInput(iso: string, dateOnly = false): string {
@@ -27,34 +30,78 @@ function fromInput(value: string, endOfDay = false): string {
  */
 type Draft = Pick<
   CalendarEvent,
-  'title' | 'start' | 'end' | 'allDay' | 'calendarId' | 'location' | 'place' | 'description'
+  'title' | 'start' | 'end' | 'allDay' | 'calendarId' | 'location' | 'place' | 'description' | 'recurrence'
 >;
 
 /** Long enough to coalesce a burst of typing, short enough to feel immediate. */
 const COMMIT_MS = 300;
 
-export default function EventEditor() {
-  const event = useStore((s) => s.events.find((e) => e.id === s.selectedEventId));
-  const calendars = useStore((s) => s.calendars);
-  const updateEvent = useStore((s) => s.updateEvent);
-  const deleteEvent = useStore((s) => s.deleteEvent);
-  const select = useStore((s) => s.select);
+/** Empty and absent are the same thing for every field the editor writes. */
+function equal(a: unknown, b: unknown): boolean {
+  const norm = (v: unknown) => (v === '' || v === undefined ? null : v);
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+}
 
-  const titleRef = useRef<HTMLInputElement>(null);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+function changesOf(baseline: Draft, draft: Draft): Partial<NewEvent> {
+  const out: Partial<NewEvent> = {};
+  for (const key of Object.keys(draft) as Array<keyof Draft>) {
+    if (!equal(draft[key], baseline[key])) Object.assign(out, { [key]: draft[key] });
+  }
+  return out;
+}
 
-  // Mounted with key={selectedEventId}, so this initialiser runs once per event
-  // and never has to be re-seeded.
-  const [draft, setDraft] = useState<Draft>(() => ({
+function initialDraft(
+  event: CalendarEvent | null,
+  master: CalendarEvent | null,
+  fallbackCalendar: string,
+): Draft {
+  return {
     title: event?.title ?? '',
     start: event?.start ?? toLocalISO(new Date()),
     end: event?.end ?? toLocalISO(new Date()),
     allDay: event?.allDay ?? false,
-    calendarId: event?.calendarId ?? calendars[0]?.id ?? 'personal',
+    calendarId: event?.calendarId ?? fallbackCalendar,
     location: event?.location ?? '',
     place: event?.place,
     description: event?.description ?? '',
-  }));
+    // An edited occurrence carries no rule of its own; it still belongs to one.
+    recurrence: event?.recurrence ?? master?.recurrence,
+  };
+}
+
+export default function EventEditor() {
+  const events = useStore((s) => s.events);
+  const selectedId = useStore((s) => s.selectedEventId);
+  const calendars = useStore((s) => s.calendars);
+  const updateEvent = useStore((s) => s.updateEvent);
+  const updateEventScoped = useStore((s) => s.updateEventScoped);
+  const deleteEvent = useStore((s) => s.deleteEvent);
+  const deleteEventScoped = useStore((s) => s.deleteEventScoped);
+  const select = useStore((s) => s.select);
+
+  // The id may name an occurrence that has no row of its own.
+  const event = useMemo(() => resolveEvent(events, selectedId), [events, selectedId]);
+  const master = useMemo(() => (event ? masterOf(events, event) : null), [events, event]);
+
+  const titleRef = useRef<HTMLInputElement>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmSave, setConfirmSave] = useState(false);
+
+  /**
+   * Whether this was already part of a series when the dialog opened. That is
+   * what decides how edits are committed, so it is captured once: turning
+   * repeat *on* mid-edit must not switch the dialog into series mode under the
+   * user's hands.
+   */
+  const [series] = useState(() => Boolean(event && isSeriesEvent(event)));
+
+  // Mounted with key={selectedEventId}, so these initialisers run once per event
+  // and never have to be re-seeded. The baseline is what "changed" is measured
+  // against when a series edit has to be committed all at once.
+  const [baseline] = useState<Draft>(() =>
+    initialDraft(event, master, calendars[0]?.id ?? 'personal'),
+  );
+  const [draft, setDraft] = useState<Draft>(baseline);
 
   const eventId = event?.id ?? null;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -70,10 +117,16 @@ export default function EventEditor() {
     if (eventId && Object.keys(patch).length > 0) updateEvent(eventId, patch);
   }, [eventId, updateEvent]);
 
-  /** Update what is on screen now; write it through on a trailing debounce. */
+  /**
+   * Update what is on screen now. A one-off event writes through on a trailing
+   * debounce, as it always has; an occurrence of a series cannot, because there
+   * is no way to know yet whether the user means this one or all of them — so
+   * it stays local until Save asks.
+   */
   const set = useCallback(
     (patch: Partial<Draft>, immediate = false) => {
       setDraft((d) => ({ ...d, ...patch }));
+      if (series) return;
       pending.current = { ...pending.current, ...patch };
       if (immediate) {
         flush();
@@ -82,7 +135,7 @@ export default function EventEditor() {
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(flush, COMMIT_MS);
     },
-    [flush],
+    [flush, series],
   );
 
   // Closing, switching events or navigating away must not drop the last few
@@ -112,6 +165,33 @@ export default function EventEditor() {
   }, [select]);
 
   if (!event) return null;
+
+  const changes = series ? changesOf(baseline, draft) : {};
+  const ruleChanged = Object.prototype.hasOwnProperty.call(changes, 'recurrence');
+  const dirty = Object.keys(changes).length > 0;
+
+  const save = () => {
+    if (!dirty) {
+      select(null);
+      return;
+    }
+    setConfirmSave(true);
+  };
+
+  const commit = (scope: SeriesScope) => {
+    updateEventScoped(event.id, changes, scope);
+    setConfirmSave(false);
+    select(null);
+  };
+
+  const remove = (scope: SeriesScope) => {
+    // Drop anything queued — it would resurrect the row.
+    pending.current = {};
+    if (timer.current) clearTimeout(timer.current);
+    if (series) deleteEventScoped(event.id, scope);
+    else deleteEvent(event.id);
+    select(null);
+  };
 
   const color = calendarColor(calendars, draft.calendarId);
 
@@ -177,6 +257,13 @@ export default function EventEditor() {
             </div>
           </div>
 
+          <RecurrenceField
+            value={draft.recurrence}
+            start={draft.start}
+            onChange={(recurrence) => set({ recurrence }, true)}
+            className={field}
+          />
+
           <div>
             <div className="mb-1 text-[11px] uppercase tracking-wider text-ink-faint">Calendar</div>
             <select
@@ -212,17 +299,11 @@ export default function EventEditor() {
         </div>
 
         <div className="flex items-center justify-between border-t border-line p-3">
-          {confirmDelete ? (
+          {confirmDelete && !series ? (
             <div className="flex items-center gap-2 text-sm">
               <span className="text-ink-soft">Delete this event?</span>
               <button
-                onClick={() => {
-                  // Drop anything queued — it would resurrect the row.
-                  pending.current = {};
-                  if (timer.current) clearTimeout(timer.current);
-                  deleteEvent(event.id);
-                  select(null);
-                }}
+                onClick={() => remove('all')}
                 className="rounded-md bg-red-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-red-700"
               >
                 Delete
@@ -244,13 +325,37 @@ export default function EventEditor() {
             </button>
           )}
           <button
-            onClick={() => select(null)}
+            onClick={series ? save : () => select(null)}
             className="rounded-md bg-ink px-3 py-1.5 text-xs font-medium text-panel hover:opacity-90"
           >
-            Done
+            {series ? (dirty ? 'Save' : 'Done') : 'Done'}
           </button>
         </div>
       </div>
+
+      {series && confirmSave && (
+        <ScopeDialog
+          title="Save repeating event"
+          action="Save"
+          // Changing the rule itself is a statement about the whole series, so
+          // there is no single-occurrence version of it.
+          options={ruleChanged ? ['all', 'following'] : ['this', 'following', 'all']}
+          note={ruleChanged ? 'Changing how often it repeats applies from a whole series.' : undefined}
+          onConfirm={commit}
+          onCancel={() => setConfirmSave(false)}
+        />
+      )}
+
+      {series && confirmDelete && (
+        <ScopeDialog
+          title={`Delete "${event.title}"`}
+          action="Delete"
+          destructive
+          options={['this', 'following', 'all']}
+          onConfirm={remove}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
     </>
   );
 }

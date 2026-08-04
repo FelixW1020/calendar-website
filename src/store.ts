@@ -1,7 +1,18 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type { Calendar, CalendarEvent, ChatMessage, PendingConfirmation, ViewMode } from './types';
-import { toLocalISO } from './lib/dates';
+import { parse, toLocalISO } from './lib/dates';
+import {
+  WEEKDAYS,
+  formatRule,
+  masterOf,
+  parseRule,
+  resolveEvent,
+  ruleEndingBefore,
+  ruleStartingAt,
+  type Rule,
+  type SeriesScope,
+} from './lib/recurrence';
 
 export const PALETTE = [
   '#2b6cb0', // steel blue
@@ -104,6 +115,56 @@ const deferredStorage = {
   },
 };
 
+/* -------------------------------------------------------------------------- */
+/* Series helpers                                                             */
+/* -------------------------------------------------------------------------- */
+
+/** The stored events that stand in for one occurrence of a series. */
+function overridesOf(events: CalendarEvent[], masterId: string): CalendarEvent[] {
+  return events.filter((e) => e.recurrenceId === masterId && e.originalStart);
+}
+
+/** Move an ISO timestamp by a number of milliseconds, keeping local wall time. */
+function shift(iso: string, ms: number): string {
+  return ms === 0 ? iso : toLocalISO(new Date(parse(iso).getTime() + ms));
+}
+
+/**
+ * What a patch does to the occurrence it was applied to. Moving an event keeps
+ * its length; resizing it keeps its start — the same two gestures the grid
+ * offers.
+ */
+function retimed(
+  occurrence: CalendarEvent,
+  patch: Partial<NewEvent>,
+): { start: Date; end: Date; delta: number } | null {
+  if (patch.start === undefined && patch.end === undefined) return null;
+  const oldStart = parse(occurrence.start);
+  const length = parse(occurrence.end).getTime() - oldStart.getTime();
+  const start = patch.start ? parse(patch.start) : oldStart;
+  const end = patch.end ? parse(patch.end) : new Date(start.getTime() + length);
+  return { start, end, delta: start.getTime() - oldStart.getTime() };
+}
+
+/**
+ * A weekly rule names the days it lands on, so dragging an occurrence to
+ * another weekday has to carry the rule with it — otherwise "every Monday"
+ * would keep booking Mondays around an event that now happens on Tuesday.
+ */
+function retargetWeekday(rule: Rule, fromDay: number, toDay: number): Rule {
+  if (rule.freq !== 'WEEKLY' || !rule.byDay?.length || fromDay === toDay) return rule;
+  const from = WEEKDAYS[fromDay];
+  const to = WEEKDAYS[toDay];
+  if (!rule.byDay.includes(from) || rule.byDay.includes(to)) return rule;
+  return { ...rule, byDay: rule.byDay.map((d) => (d === from ? to : d)) };
+}
+
+/** An event's own fields, ready to be re-created as a standalone row. */
+function detach(ev: CalendarEvent): NewEvent {
+  const { id: _id, createdAt: _c, updatedAt: _u, recurrence: _r, exdates: _x, ...rest } = ev;
+  return rest;
+}
+
 export type SyncStatus = 'off' | 'signed-out' | 'syncing' | 'live' | 'error';
 
 export interface SyncState {
@@ -133,6 +194,15 @@ interface State {
   createEvent: (e: NewEvent) => CalendarEvent;
   updateEvent: (id: string, patch: Partial<NewEvent>) => CalendarEvent | null;
   deleteEvent: (id: string) => CalendarEvent | null;
+
+  // Series-aware. `id` may name an expanded occurrence, and `scope` says how
+  // far the change reaches. Both fall back to the plain action off a series.
+  updateEventScoped: (
+    id: string,
+    patch: Partial<NewEvent>,
+    scope?: SeriesScope,
+  ) => CalendarEvent | null;
+  deleteEventScoped: (id: string, scope?: SeriesScope) => CalendarEvent | null;
 
   addCalendar: (name: string, color: string) => Calendar;
   toggleCalendar: (id: string) => void;
@@ -206,6 +276,159 @@ export const useStore = create<State>()(
           emit({ kind: 'event.delete', id });
         }
         return found;
+      },
+
+      updateEventScoped: (id, patch, scope = 'all') => {
+        const state = get();
+        const target = resolveEvent(state.events, id);
+        if (!target) return null;
+
+        const master = masterOf(state.events, target);
+        const rule = master ? parseRule(master.recurrence) : null;
+        if (!master || !rule) return state.updateEvent(target.id, patch);
+
+        const occStart = target.originalStart ?? target.start;
+        const times = retimed(target, patch);
+        const rulePatched = Object.prototype.hasOwnProperty.call(patch, 'recurrence');
+        const overrides = overridesOf(state.events, master.id);
+        const isStored = state.events.some((e) => e.id === target.id);
+
+        // A rule change is a statement about the series, so it cannot land on a
+        // single occurrence; the editor only offers the other two scopes, and
+        // anything else asking for one gets the whole series instead.
+        const reach: SeriesScope = scope === 'this' && rulePatched ? 'all' : scope;
+
+        /* ------------------------------------------------------ this event -- */
+        if (reach === 'this') {
+          if (isStored && target.recurrenceId) return state.updateEvent(target.id, patch);
+          return state.createEvent({
+            ...detach(target),
+            ...patch,
+            recurrenceId: master.id,
+            originalStart: occStart,
+          });
+        }
+
+        /* ------------------------------- this and everything following it -- */
+        const boundary = parse(occStart);
+        const head = occStart === master.start ? null : ruleEndingBefore(master, rule, boundary);
+
+        if (reach === 'following' && head) {
+          const start = times?.start ?? parse(target.start);
+          const end = times?.end ?? parse(target.end);
+          const delta = times?.delta ?? 0;
+          const exdates = master.exdates ?? [];
+
+          state.updateEvent(master.id, {
+            recurrence: formatRule(head.rule),
+            exdates: exdates.filter((d) => parse(d) < boundary),
+          });
+
+          const tail = ruleStartingAt(rule, head.kept);
+          const created = state.createEvent({
+            ...detach(target),
+            ...patch,
+            start: toLocalISO(start),
+            end: toLocalISO(end),
+            recurrence: rulePatched
+              ? patch.recurrence
+              : formatRule(retargetWeekday(tail, boundary.getDay(), start.getDay())),
+            exdates: exdates.filter((d) => parse(d) >= boundary).map((d) => shift(d, delta)),
+            recurrenceId: undefined,
+            originalStart: undefined,
+          });
+
+          // Occurrences the user had already edited by hand move across too.
+          for (const o of overrides) {
+            if (parse(o.originalStart!) < boundary) continue;
+            state.updateEvent(o.id, {
+              recurrenceId: created.id,
+              start: shift(o.start, delta),
+              end: shift(o.end, delta),
+              originalStart: shift(o.originalStart!, delta),
+            });
+          }
+          return created;
+        }
+
+        /* ------------------------------------------------------ all events -- */
+        // Also the path for "following" from the first occurrence, where there
+        // is nothing to split off.
+        const masterPatch: Partial<NewEvent> = { ...patch };
+        const delta = times?.delta ?? 0;
+
+        if (times) {
+          const start = new Date(parse(master.start).getTime() + delta);
+          masterPatch.start = toLocalISO(start);
+          masterPatch.end = toLocalISO(
+            new Date(start.getTime() + (times.end.getTime() - times.start.getTime())),
+          );
+        }
+        if (!rulePatched && delta !== 0) {
+          const moved = retargetWeekday(rule, boundary.getDay(), times!.start.getDay());
+          if (moved !== rule) masterPatch.recurrence = formatRule(moved);
+        }
+        if (delta !== 0 && master.exdates?.length) {
+          masterPatch.exdates = master.exdates.map((d) => shift(d, delta));
+        }
+        if (rulePatched && !parseRule(patch.recurrence)) {
+          // The series collapses to one ordinary event; its exceptions have
+          // nothing left to be exceptions to.
+          masterPatch.exdates = undefined;
+          for (const o of overrides) state.deleteEvent(o.id);
+        } else if (delta !== 0) {
+          for (const o of overrides) {
+            state.updateEvent(o.id, {
+              start: shift(o.start, delta),
+              end: shift(o.end, delta),
+              originalStart: shift(o.originalStart!, delta),
+            });
+          }
+        }
+        return state.updateEvent(master.id, masterPatch);
+      },
+
+      deleteEventScoped: (id, scope = 'all') => {
+        const state = get();
+        const target = resolveEvent(state.events, id);
+        if (!target) return null;
+
+        const master = masterOf(state.events, target);
+        const rule = master ? parseRule(master.recurrence) : null;
+        if (!master || !rule) return state.deleteEvent(target.id);
+
+        const occStart = target.originalStart ?? target.start;
+        const overrides = overridesOf(state.events, master.id);
+
+        if (scope === 'this') {
+          // A hand-edited occurrence has a row of its own to remove, and the
+          // slot it was standing in for still has to be blocked out.
+          if (state.events.some((e) => e.id === target.id) && target.recurrenceId) {
+            state.deleteEvent(target.id);
+          }
+          state.updateEvent(master.id, {
+            exdates: [...new Set([...(master.exdates ?? []), occStart])],
+          });
+          return target;
+        }
+
+        const boundary = parse(occStart);
+        const head = occStart === master.start ? null : ruleEndingBefore(master, rule, boundary);
+
+        if (scope === 'following' && head) {
+          state.updateEvent(master.id, {
+            recurrence: formatRule(head.rule),
+            exdates: (master.exdates ?? []).filter((d) => parse(d) < boundary),
+          });
+          for (const o of overrides) {
+            if (parse(o.originalStart!) >= boundary) state.deleteEvent(o.id);
+          }
+          return target;
+        }
+
+        for (const o of overrides) state.deleteEvent(o.id);
+        state.deleteEvent(master.id);
+        return target;
       },
 
       addCalendar: (name, color) => {

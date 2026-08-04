@@ -40,6 +40,19 @@ alter table public.events add column if not exists place_lat   double precision;
 alter table public.events add column if not exists place_lon   double precision;
 alter table public.events add column if not exists place_label text;
 
+-- Recurrence exceptions. A repeating event is one row carrying an RRULE in
+-- `recurrence`; the occurrences are expanded on the client. These three columns
+-- hold the two ways an occurrence can differ from the rule: `exdates` lists the
+-- ones that were deleted, and a row with `recurrence_id` set replaces the single
+-- occurrence named by `original_start`. Both are local wall-time strings — they
+-- name a slot in the rule rather than a point on the timeline.
+alter table public.events add column if not exists exdates        text[];
+alter table public.events add column if not exists recurrence_id  text;
+alter table public.events add column if not exists original_start text;
+
+create index if not exists events_user_series_idx
+  on public.events (user_id, recurrence_id);
+
 create index if not exists events_user_start_idx
   on public.events (user_id, starts_at);
 

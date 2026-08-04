@@ -24,8 +24,18 @@ export interface CalendarEvent {
   end: string;
   allDay: boolean;
   calendarId: string;
-  /** Reserved for v1.5 recurrence (RFC 5545 RRULE). Not expanded yet. */
+  /**
+   * RFC 5545 RRULE on the series master, e.g. `FREQ=WEEKLY;BYDAY=MO,WE`. The
+   * master is the first occurrence; the rest are expanded at read time. See
+   * lib/recurrence.ts for the supported grammar.
+   */
   recurrence?: string;
+  /** Occurrence starts (ISO) removed from this series. Master only. */
+  exdates?: string[];
+  /** On an event that replaces one occurrence: the id of the series master. */
+  recurrenceId?: string;
+  /** On such an event: the occurrence start it stands in for. */
+  originalStart?: string;
   createdAt: string;
   updatedAt: string;
 }

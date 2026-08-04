@@ -2,7 +2,8 @@ import { useMemo, useRef, useState } from 'react';
 import type { ViewMode } from '../types';
 import { calendarColor, useStore, visibleEvents } from '../store';
 import { format, parse, rangeLabel, step } from '../lib/dates';
-import { ChevronLeft, ChevronRight, Cloud, Menu, Moon, Search, Sun } from './Icons';
+import { isSeriesEvent, nextOccurrence } from '../lib/recurrence';
+import { ChevronLeft, ChevronRight, Cloud, Menu, Moon, Repeat, Search, Sun } from './Icons';
 
 const VIEWS: { id: ViewMode; label: string; short: string }[] = [
   { id: 'day', label: 'Day', short: 'D' },
@@ -223,8 +224,12 @@ function SearchResults({ onPick }: { onPick: () => void }) {
   const results = useMemo(() => {
     const q = search.toLowerCase().trim();
     if (!q) return [];
+    const now = new Date();
     return visibleEvents(events, calendars)
       .filter((e) => `${e.title} ${e.location ?? ''} ${e.description ?? ''}`.toLowerCase().includes(q))
+      // A repeating event is one row. Offer the occurrence the user would
+      // actually want to jump to — the next one — rather than the first ever.
+      .map((e) => (e.recurrence ? nextOccurrence(e, now) ?? e : e))
       .sort((a, b) => a.start.localeCompare(b.start))
       .slice(0, 12);
   }, [search, events, calendars]);
@@ -252,6 +257,7 @@ function SearchResults({ onPick }: { onPick: () => void }) {
               {ev.title}
               {ev.location ? <span className="text-ink-faint"> · {ev.location}</span> : null}
             </span>
+            {isSeriesEvent(ev) && <Repeat className="h-3 w-3 shrink-0 text-ink-faint" />}
             <span className="shrink-0 text-xs text-ink-faint">{format(parse(ev.start), 'MMM d')}</span>
           </button>
         ))

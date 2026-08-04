@@ -28,6 +28,11 @@ function rowToEvent(r: EventRow): CalendarEvent {
     allDay: r.all_day,
     calendarId: r.calendar_id,
     recurrence: r.recurrence ?? undefined,
+    // Occurrence keys are wall-time strings rather than instants: they identify
+    // a slot in the rule, not a point on the timeline, so they travel verbatim.
+    exdates: r.exdates?.length ? r.exdates : undefined,
+    recurrenceId: r.recurrence_id ?? undefined,
+    originalStart: r.original_start ?? undefined,
     createdAt: toLocalISO(new Date(r.created_at)),
     updatedAt: toLocalISO(new Date(r.updated_at)),
   };
@@ -48,6 +53,9 @@ function eventToRow(e: CalendarEvent, userId: string) {
     ends_at: parse(e.end).toISOString(),
     all_day: e.allDay,
     recurrence: e.recurrence ?? null,
+    exdates: e.exdates?.length ? e.exdates : null,
+    recurrence_id: e.recurrenceId ?? null,
+    original_start: e.originalStart ?? null,
     created_at: parse(e.createdAt).toISOString(),
     updated_at: parse(e.updatedAt).toISOString(),
     deleted_at: null,

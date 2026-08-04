@@ -112,6 +112,15 @@ export function Pin({ className = base }: Props) {
   );
 }
 
+export function Repeat({ className = base }: Props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>
+      <path d="M4 9a5 5 0 015-5h9m0 0l-3-3m3 3l-3 3" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M20 15a5 5 0 01-5 5H6m0 0l3 3m-3-3l3-3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export function Spinner({ className = base }: Props) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className={className}>

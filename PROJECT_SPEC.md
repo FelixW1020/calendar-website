@@ -65,7 +65,10 @@ type CalendarEvent = {
   end: string;             // ISO 8601 with offset
   allDay: boolean;
   calendarId: string;      // which local calendar it belongs to
-  recurrence?: RRuleString; // RFC 5545 RRULE, v1.5 — see §9
+  recurrence?: RRuleString; // RFC 5545 RRULE on the series master (v1.5)
+  exdates?: string[];       // occurrences deleted out of the series
+  recurrenceId?: string;    // set on an event replacing one occurrence
+  originalStart?: string;   //   ...of this moment in the series
   createdAt: string;
   updatedAt: string;
 };
@@ -91,7 +94,7 @@ message thread and an input box.
 | User types | Expected result |
 |---|---|
 | "lunch with Priya Thursday at 1" | Event Thu 1:00–2:00pm (default 1h duration) |
-| "gym every Monday and Wednesday 7am" | Recurring event, or two events in v1 |
+| "gym every Monday and Wednesday 7am" | One repeating event, FREQ=WEEKLY;BYDAY=MO,WE |
 | "block 9-11 tomorrow for deep work" | Event tomorrow 9:00–11:00am |
 | "move my dentist appointment to Friday" | Finds the event, updates its date |
 | "what do I have on Tuesday?" | Reads back the day's schedule, creates nothing |
@@ -255,10 +258,12 @@ Dark mode is required — a calendar is something you leave open all day.
 ## 8. Open Questions
 
 - [ ] **Direct browser calls or proxy?** (§3) Blocks the chat implementation.
-- [ ] **Recurring events in v1, or defer?** Full RRULE support is a meaningful
-      chunk of work — expansion, exceptions, "edit this / all / following."
-      Recommendation: defer to v1.5, but design the event model with the
-      `recurrence` field present so it isn't a migration later.
+- [x] **Recurring events in v1, or defer?** Deferred, then built (v1.5). The
+      useful subset of RRULE — FREQ, INTERVAL, BYDAY, BYMONTHDAY, COUNT, UNTIL —
+      with expansion at read time, exceptions on the master (`exdates` plus
+      override events), and "this / this and following / all" on every edit and
+      delete. Keeping the `recurrence` field in the v1 model meant no migration.
+      See `src/lib/recurrence.ts`.
 - [ ] **Should the chat be able to read the calendar, or only write?**
       Recommendation: read too (`list_events` / `find_events`) — it's what makes
       "move my dentist appointment" work, and it's how you'd ask a person.
@@ -271,6 +276,7 @@ Dark mode is required — a calendar is something you leave open all day.
 
 - Multi-user, sharing, invitations, RSVPs
 - Google/Outlook/CalDAV sync or ICS import-export
-- Recurring events (deferred to v1.5, model field reserved)
+- The rest of RFC 5545: BYSETPOS, BYWEEKNO, multiple rules on one event
+  (recurrence itself shipped in v1.5)
 - Notifications and reminders
 - Native mobile apps (responsive web only)
