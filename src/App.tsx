@@ -31,6 +31,7 @@ export default function App() {
   const theme = useStore((s) => s.theme);
   const apiKey = useStore((s) => s.apiKey);
   const selectedEventId = useStore((s) => s.selectedEventId);
+  const confirmation = useStore((s) => s.confirmation);
 
   const anchor = useMemo(() => new Date(anchorISO), [anchorISO]);
   const days = useMemo(() => daysIn(visibleRange(anchor, view)), [anchor, view]);
@@ -51,6 +52,13 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
   }, [theme]);
+
+  // The assistant asks its questions inside the panel, so on a phone — where the
+  // panel is a sheet that is usually closed — one could go unseen while the turn
+  // waits on it.
+  useEffect(() => {
+    if (confirmation) setChatOpen(true);
+  }, [confirmation]);
 
   // Offer the key prompt once on a cold start, then stay out of the way.
   useEffect(() => {

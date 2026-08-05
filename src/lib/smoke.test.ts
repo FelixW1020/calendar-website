@@ -319,7 +319,7 @@ console.log('\nediting a series');
     key: () => null,
     length: 0,
   };
-  const { useStore } = await import('../store');
+  const { useStore, diffEvents, isEmptyRestore } = await import('../store');
 
   const week = { from: new Date(2026, 7, 1), to: new Date(2026, 8, 1) };
   /** 7am on a day in August 2026, the wall time the series is anchored on. */
@@ -404,6 +404,104 @@ console.log('\nediting a series');
     useStore.getState().updateEventScoped(occurrenceId(master.id, morning(5)), { recurrence: undefined }, 'all');
     assert.deepEqual(dates(), ['5 07:00']);
     ok('clearing the rule leaves one ordinary event behind');
+  }
+
+  console.log('\nundoing a delete');
+  /** Run a change and hand back what it would take to reverse it. */
+  const undoable = (change: () => void) => {
+    const before = useStore.getState().events;
+    change();
+    return diffEvents(before, useStore.getState().events);
+  };
+
+  {
+    useStore.setState({ events: [] });
+    const one = useStore.getState().createEvent({
+      title: 'Dentist',
+      start: morning(5, 14),
+      end: morning(5, 15),
+      allDay: false,
+      calendarId: 'personal',
+    });
+    const back = undoable(() => useStore.getState().deleteEventScoped(one.id, 'all'));
+    assert.deepEqual(useStore.getState().events, []);
+
+    useStore.getState().restoreEvents(back);
+    const [again] = useStore.getState().events;
+    assert.equal(again.id, one.id, 'the same row comes back, not a copy of it');
+    assert.equal(again.title, 'Dentist');
+    assert.equal(again.start, one.start);
+    // The server is holding a tombstone stamped after the original row; coming
+    // back with the old timestamp would lose to it on the next merge.
+    assert.ok(parse(again.updatedAt) >= parse(one.updatedAt), 'a restore counts as a write');
+    ok('a deleted event comes back with its own id');
+  }
+  {
+    // Deleting one occurrence edits the master rather than removing a row, so
+    // undo has to put a *changed* row back, not a missing one.
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    const back = undoable(() =>
+      useStore.getState().deleteEventScoped(occurrenceId(master.id, morning(12)), 'this'),
+    );
+    assert.deepEqual(dates(), ['5 07:00', '19 07:00', '26 07:00']);
+    assert.equal(back.restore.length, 1, 'the master is what changed');
+    assert.deepEqual(back.remove, []);
+
+    useStore.getState().restoreEvents(back);
+    assert.deepEqual(dates(), ['5 07:00', '12 07:00', '19 07:00', '26 07:00']);
+    assert.equal(useStore.getState().events[0].exdates, undefined, 'the hole is filled in again');
+    ok('undoing one skipped occurrence restores the series');
+  }
+  {
+    // "This and following" rewrites the rule and drops the edited occurrences
+    // after it. Both have to come back.
+    const master = startAugust('FREQ=WEEKLY;BYDAY=WE');
+    useStore.getState().updateEventScoped(
+      occurrenceId(master.id, morning(26)),
+      { title: 'Long run' },
+      'this',
+    );
+    assert.equal(useStore.getState().events.length, 2);
+
+    const back = undoable(() =>
+      useStore.getState().deleteEventScoped(occurrenceId(master.id, morning(19)), 'following'),
+    );
+    assert.deepEqual(dates(), ['5 07:00', '12 07:00']);
+
+    useStore.getState().restoreEvents(back);
+    assert.deepEqual(dates(), ['5 07:00', '12 07:00', '19 07:00', '26 07:00']);
+    assert.equal(useStore.getState().events.length, 2, 'the hand-edited occurrence is back too');
+    ok('undoing a split puts the rule and its exceptions back');
+  }
+  {
+    // Undo must reverse the deletion and nothing else.
+    useStore.setState({ events: [] });
+    const doomed = useStore.getState().createEvent({
+      title: 'Standup',
+      start: morning(5),
+      end: morning(5, 8),
+      allDay: false,
+      calendarId: 'personal',
+    });
+    const back = undoable(() => useStore.getState().deleteEventScoped(doomed.id, 'all'));
+    const later = useStore.getState().createEvent({
+      title: 'Booked afterwards',
+      start: morning(6),
+      end: morning(6, 8),
+      allDay: false,
+      calendarId: 'personal',
+    });
+
+    useStore.getState().restoreEvents(back);
+    const titles = useStore.getState().events.map((e) => e.title).sort();
+    assert.deepEqual(titles, ['Booked afterwards', 'Standup']);
+    assert.ok(useStore.getState().events.some((e) => e.id === later.id));
+    ok('undo leaves everything booked since then alone');
+  }
+  {
+    const before = useStore.getState().events;
+    assert.equal(isEmptyRestore(diffEvents(before, before)), true);
+    ok('a change that changed nothing offers no undo');
   }
 }
 
