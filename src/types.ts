@@ -47,6 +47,18 @@ export interface Calendar {
   visible: boolean;
 }
 
+/**
+ * Everything needed to put the calendar back exactly as it was before a change.
+ * Deleting is the one action a person cannot walk back on their own, so instead
+ * of asking first, the assistant does it and hands back one of these.
+ */
+export interface EventRestore {
+  /** Rows as they were, to be put back verbatim. */
+  restore: CalendarEvent[];
+  /** Ids the change created, which have to go again. */
+  remove: string[];
+}
+
 export type ChatRole = 'user' | 'assistant';
 
 export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -69,6 +81,8 @@ export interface ChatMessage {
   images?: ChatImage[];
   /** Human-readable log of tool calls made during this turn. */
   actions?: string[];
+  /** One-click undo for whatever this turn removed. */
+  undo?: { label: string; events: EventRestore; done?: boolean };
   error?: boolean;
   pending?: boolean;
 }

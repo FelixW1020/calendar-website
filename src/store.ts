@@ -1,6 +1,13 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import type { Calendar, CalendarEvent, ChatMessage, PendingConfirmation, ViewMode } from './types';
+import type {
+  Calendar,
+  CalendarEvent,
+  ChatMessage,
+  EventRestore,
+  PendingConfirmation,
+  ViewMode,
+} from './types';
 import { parse, toLocalISO } from './lib/dates';
 import {
   WEEKDAYS,
@@ -159,6 +166,30 @@ function retargetWeekday(rule: Rule, fromDay: number, toDay: number): Rule {
   return { ...rule, byDay: rule.byDay.map((d) => (d === from ? to : d)) };
 }
 
+/**
+ * What it would take to reverse a change, as the difference between two
+ * snapshots of the calendar. Deleting one occurrence of a series *edits* the
+ * master rather than removing a row, and "this and following" rewrites its
+ * rule — so undo cannot simply put back what disappeared. Comparing before and
+ * after catches every shape of it without knowing which one happened.
+ */
+export function diffEvents(before: CalendarEvent[], after: CalendarEvent[]): EventRestore {
+  const now = new Map(after.map((e) => [e.id, e]));
+  const had = new Set(before.map((e) => e.id));
+  return {
+    restore: before.filter((e) => {
+      const current = now.get(e.id);
+      return !current || JSON.stringify(current) !== JSON.stringify(e);
+    }),
+    remove: after.filter((e) => !had.has(e.id)).map((e) => e.id),
+  };
+}
+
+/** Whether a diff would actually change anything. */
+export function isEmptyRestore(r: EventRestore): boolean {
+  return r.restore.length === 0 && r.remove.length === 0;
+}
+
 /** An event's own fields, ready to be re-created as a standalone row. */
 function detach(ev: CalendarEvent): NewEvent {
   const { id: _id, createdAt: _c, updatedAt: _u, recurrence: _r, exdates: _x, ...rest } = ev;
@@ -203,6 +234,9 @@ interface State {
     scope?: SeriesScope,
   ) => CalendarEvent | null;
   deleteEventScoped: (id: string, scope?: SeriesScope) => CalendarEvent | null;
+
+  /** Reverse a change, from the diff of the two snapshots around it. */
+  restoreEvents: (r: EventRestore) => void;
 
   addCalendar: (name: string, color: string) => Calendar;
   toggleCalendar: (id: string) => void;
@@ -429,6 +463,24 @@ export const useStore = create<State>()(
         for (const o of overrides) state.deleteEvent(o.id);
         state.deleteEvent(master.id);
         return target;
+      },
+
+      restoreEvents: (r) => {
+        // Sync resolves conflicts by last write, and the server is holding a
+        // tombstone stamped after the row being put back. Restoring it with its
+        // original timestamp would lose the race and delete it all over again
+        // on the next merge, so a restore counts as a write of its own.
+        const stamp = toLocalISO(new Date());
+        const restored = r.restore.map((e) => ({ ...e, updatedAt: stamp }));
+        const gone = new Set(r.remove);
+        const replaced = new Set(restored.map((e) => e.id));
+
+        set((s) => ({
+          events: [...s.events.filter((e) => !gone.has(e.id) && !replaced.has(e.id)), ...restored],
+        }));
+
+        for (const e of restored) emit({ kind: 'event.upsert', event: e });
+        for (const id of r.remove) emit({ kind: 'event.delete', id });
       },
 
       addCalendar: (name, color) => {

@@ -125,16 +125,31 @@ press has to stay available for scrolling.
 - `move my dentist appointment to Friday`
 - `skip gym tomorrow` / `gym is at 8 from now on` — the same three scopes, chosen from what you said
 - `what do I have on Tuesday?` — reads back, creates nothing
-- `cancel the 3pm` — asks you to confirm first
+- `cancel the 3pm` / `clear my Friday` — done at once, with an Undo
 
 It runs on tool use, not text parsing: the model is given `create_event`,
-`update_event`, `delete_event`, `list_events`, and `find_events`, and calls them
+`update_event`, `delete_events`, `list_events`, and `find_events`, and calls them
 with schema-validated arguments. That's what makes "move my dentist appointment"
 work — it can search the calendar before it writes to it.
 
-Ambiguous requests get a clarifying question rather than a guess. Deletions,
-moves to a different day, and any change that reaches past the one occurrence
-you asked about pause for a yes/no in the chat panel before they happen.
+Ambiguous requests get a clarifying question rather than a guess. Moves to a
+different day, and changes that reach past the one occurrence you asked about,
+pause for a yes/no in the chat panel before they happen.
+
+**Cancelling doesn't stop to ask.** It used to: every deletion waited on a
+yes/no, so clearing one afternoon meant answering the same question five times,
+and each one cost a round trip. Now a deletion happens immediately and the reply
+carries an **Undo** — one click, and everything that call removed comes back
+with the same ids, repeat rules and all. Undo is better than a prompt on both
+counts: it is out of the way when the assistant was right, and it still saves
+you when it was wrong, which a prompt agreeing with itself does not.
+
+The button stays for as long as the message does, so nothing depends on being
+quick. It goes when the chat is cleared or the page is reloaded — the transcript
+is not persisted — so the safety net is the session, not forever.
+
+Everything cancelled in one breath is one tool call, so "clear my Friday" is a
+single deletion and a single Undo rather than five of each.
 
 ---
 

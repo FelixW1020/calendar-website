@@ -43,6 +43,8 @@ export interface AssistantDeps {
   confirm: (prompt: string) => Promise<boolean>;
   /** Called with a human-readable line for each tool the model runs. */
   onAction: (line: string) => void;
+  /** Offers the user a way back from a change, as the two snapshots around it. */
+  onUndoable: (before: CalendarEvent[], after: CalendarEvent[], label: string) => void;
   /** Called when an event is created or changed, so the view can follow it. */
   onEventTouched: (event: CalendarEvent) => void;
 }
@@ -151,6 +153,21 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     'to gym" is "all". When it is genuinely unclear, ask. Ids from list_events',
     'name one occurrence, which is what makes "this" possible — use them as given.',
     '',
+    '## Cancelling things',
+    'Deleting is immediate and the user has a one-click Undo for anything you',
+    'remove, so do not ask "are you sure" and do not talk them through it — cancel',
+    'what they asked to cancel and tell them in one line. Everything going in the',
+    'same breath goes in one delete_events call: "clear my Friday" is one call with',
+    'every id, not one call per event.',
+    '',
+    'The one thing worth a question first is *which* event: if "cancel lunch" could',
+    'mean either of two lunches, ask which, and name them by day and time. Being',
+    'wrong about which one is the mistake Undo is least likely to catch, because it',
+    'looks like it worked.',
+    '',
+    'Deleting nothing is also an answer. If they ask you to cancel something that is',
+    'not there, say so rather than removing the nearest thing.',
+    '',
     '## Answering',
     'When the user asks what is on their schedule, read it back and create nothing.',
     '',
@@ -159,8 +176,8 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     'plain language the user used. No preamble, no bulleted summary of a single',
     'action, no restating the whole event back when a short confirmation will do.',
     'The change is already visible on the calendar next to you.',
-    'Deletions and moves to a different day are confirmed with the user by the',
-    'tools themselves — do not ask for permission separately, just call the tool.',
+    'Moves to a different day are confirmed with the user by the tools themselves —',
+    'do not ask for permission separately, just call the tool.',
   ].join('\n');
 }
 
@@ -487,59 +504,83 @@ function buildTools(deps: AssistantDeps) {
     },
   });
 
-  const deleteEvent = betaTool({
-    name: 'delete_event',
+  const deleteEvents = betaTool({
+    name: 'delete_events',
     description:
-      'Remove an event permanently. The user is asked to confirm before this takes ' +
-      'effect. Get the id from find_events or list_events first.',
+      'Remove events. Pass every event being removed in ONE call — never one call ' +
+      'per event. Deleting takes effect immediately and the user gets a one-click ' +
+      'Undo, so do not ask for permission first; just do it and say what you did. ' +
+      'Do ask first when you cannot tell which event they meant. Get ids from ' +
+      'find_events or list_events.',
     inputSchema: {
       type: 'object',
       properties: {
-        id: { type: 'string' },
+        ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Every event to remove, together.',
+        },
         scope: {
           type: 'string',
           enum: ['this', 'following', 'all'],
           description:
-            'Required for a repeating event: whether to remove this one ' +
-            'occurrence, this and every later one, or the entire series.',
+            'For repeating events only: remove just the occurrence named by the ' +
+            'id, that one and every later one, or the whole series. Defaults to ' +
+            'the whole series, so pass "this" when they mean one day.',
         },
       },
-      required: ['id'],
+      required: ['ids'],
       additionalProperties: false,
     },
-    run: async ({ id, scope: wanted }) => {
-      const existing = resolveEvent(deps.getEvents(), id);
-      if (!existing) {
-        return JSON.stringify({
-          error: `No event with id ${id}. Call find_events to get a current id.`,
-        });
-      }
+    run: async ({ ids, scope: wanted }) => {
       const scope = scopeOf(wanted);
-      const repeats = Boolean(describeEvent(existing));
-      const which = !repeats
-        ? ''
-        : scope === 'all'
-          ? ' and every other occurrence of it'
-          : scope === 'following'
-            ? ' and every later occurrence of it'
-            : ' (this occurrence only)';
-      const ok = await deps.confirm(
-        `Delete "${existing.title}" on ${prettyWhen(existing)}${which}?`,
-      );
-      if (!ok) {
-        deps.onAction(`Deletion of "${existing.title}" declined`);
+      const before = deps.getEvents();
+
+      const found = ids
+        .map((id) => ({ id, event: resolveEvent(before, id) }))
+        .filter((t): t is { id: string; event: CalendarEvent } => t.event !== null);
+      const missing = ids.filter((id) => !found.some((t) => t.id === id));
+
+      if (found.length === 0) {
         return JSON.stringify({
-          cancelled: true,
-          reason: 'The user declined this deletion. Do not retry it; the event still exists.',
+          error:
+            'None of those ids are on the calendar. Call find_events or list_events ' +
+            'for current ids rather than guessing.',
         });
       }
-      deps.deleteEvent(id, scope);
-      deps.onAction(`Deleted "${existing.title}"${repeats && scope !== 'this' ? ' and its repeats' : ''}`);
-      return JSON.stringify({ deleted: { id, title: existing.title, scope } });
+
+      for (const { id } of found) deps.deleteEvent(id, scope);
+
+      const gone = found.map((t) => t.event);
+      const repeating = gone.filter((e) => describeEvent(e));
+      const label =
+        gone.length === 1
+          ? `Deleted "${gone[0].title}" — ${prettyWhen(gone[0])}`
+          : `Deleted ${gone.length} events`;
+      const extent =
+        repeating.length > 0 && scope !== 'this'
+          ? scope === 'all'
+            ? ' and every occurrence of them'
+            : ' and every later occurrence'
+          : '';
+
+      deps.onAction(`${label}${extent}`);
+      // Handing back both snapshots lets one Undo reverse the whole call, which
+      // matters most when it removed more than the user expected.
+      deps.onUndoable(before, deps.getEvents(), label);
+
+      return JSON.stringify({
+        deleted: gone.map((e) => ({ id: e.id, title: e.title, when: prettyWhen(e) })),
+        scope,
+        undo_offered: true,
+        ...(missing.length > 0
+          ? { not_found: missing, note: 'These were already gone; say so only if it matters.' }
+          : {}),
+      });
     },
   });
 
-  return [listEvents, findEvents, createEvent, updateEvent, deleteEvent];
+  return [listEvents, findEvents, createEvent, updateEvent, deleteEvents];
 }
 
 /* -------------------------------------------------------------------------- */

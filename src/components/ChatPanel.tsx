@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ChatImage, ChatMessage } from '../types';
-import { useStore, uid } from '../store';
+import type { CalendarEvent, ChatImage, ChatMessage } from '../types';
+import { diffEvents, isEmptyRestore, useStore, uid } from '../store';
 import { parse } from '../lib/dates';
 import { AssistantError, resetConversation, sendToAssistant } from '../lib/assistant';
 import { MAX_IMAGES, dataUrl, isImageFile, readImage } from '../lib/images';
@@ -39,6 +39,17 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
   }, [chat, busy, confirmation, photos]);
+
+  // A question nobody can answer holds the turn open forever, and the assistant
+  // stays busy with it. Escape is the way out that costs nothing.
+  useEffect(() => {
+    if (!confirmation) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') resolveConfirmation(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [confirmation, resolveConfirmation]);
 
   const attach = async (files: FileList | File[] | null) => {
     if (!files) return;
@@ -86,6 +97,12 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
 
     const actions: string[] = [];
 
+    // The calendar as it stood before the first destructive tool call of this
+    // turn, so one Undo covers everything the turn removed rather than only the
+    // last thing it touched.
+    let undoFrom: CalendarEvent[] | null = null;
+    const undoLabels: string[] = [];
+
     try {
       const reply = await sendToAssistant(
         content,
@@ -99,6 +116,15 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
           onAction: (line) => {
             actions.push(line);
             useStore.getState().patchChat(replyId, { actions: [...actions] });
+          },
+          onUndoable: (before, after, label) => {
+            undoFrom ??= before;
+            undoLabels.push(label);
+            const events = diffEvents(undoFrom, after);
+            if (isEmptyRestore(events)) return;
+            useStore.getState().patchChat(replyId, {
+              undo: { label: undoLabels.join(' · '), events },
+            });
           },
           onEventTouched: (ev) => {
             // Follow the change so the user sees what just happened.
@@ -388,7 +414,40 @@ function Bubble({ message }: { message: ChatMessage }) {
           {message.text}
         </p>
       )}
+      {message.undo && <UndoBar message={message} undo={message.undo} />}
     </div>
+  );
+}
+
+/**
+ * Stays for as long as the message does rather than sliding away on a timer —
+ * the point of it is that nobody has to be quick, or watching.
+ */
+function UndoBar({
+  message,
+  undo,
+}: {
+  message: ChatMessage;
+  undo: NonNullable<ChatMessage['undo']>;
+}) {
+  const restoreEvents = useStore((s) => s.restoreEvents);
+  const patchChat = useStore((s) => s.patchChat);
+
+  if (undo.done) {
+    return <p className="text-[12px] text-ink-faint">Put back.</p>;
+  }
+
+  return (
+    <button
+      onClick={() => {
+        restoreEvents(undo.events);
+        patchChat(message.id, { undo: { ...undo, done: true } });
+      }}
+      aria-label={`Undo — ${undo.label}`}
+      className="rounded-md border border-line px-2 py-1 text-[12px] text-ink-soft transition hover:border-line-strong hover:text-ink"
+    >
+      Undo
+    </button>
   );
 }
 
