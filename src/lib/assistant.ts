@@ -26,6 +26,17 @@ const EFFORT = 'medium' as const;
 const HISTORY_TURNS = 12;
 
 /**
+ * Ceilings on what one tool call may return. Expanding a repeating event makes a
+ * date range unbounded — a single daily event is 365 entries a year — and a
+ * result that large is slow, expensive, and crowds out the rest of the turn.
+ * Both tools say when they have held something back, which matters more than
+ * the numbers: a silent truncation reads as "that is everything".
+ */
+const LIST_LIMIT = 200;
+const FIND_LIMIT = 25;
+const FIND_MAX = 100;
+
+/**
  * Photos are re-sent with every later turn, so they are the expensive part of
  * the history. Keeping them for the last few messages covers the follow-up
  * ("the second one on that flyer too") without paying for them all session.
@@ -168,6 +179,20 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     'Deleting nothing is also an answer. If they ask you to cancel something that is',
     'not there, say so rather than removing the nearest thing.',
     '',
+    '### Clearing out duplicates',
+    'Older versions of this assistant could not repeat an event, so they wrote out',
+    'a run of identical copies instead. Cleaning those up is a common request, and',
+    'the way to get it wrong is to stop early:',
+    '- find_events reports `shown` and `total`. If `shown` is smaller, you have not',
+    '  seen them all — call it again with a higher limit. Never report "all of',
+    '  them" off a partial list, and never count from a page.',
+    '- Send every id in one delete_events call.',
+    '- Several occurrence ids of one repeating event are ONE thing. Pass a single',
+    '  id with scope "all" instead of one id per occurrence, and describe what',
+    '  actually went rather than how many ids you sent.',
+    '- Say which copy survived. "Removed 15 duplicate gyms, kept the Monday 7am',
+    '  one" is the answer; "deleted the duplicates" is not.',
+    '',
     '## Answering',
     'When the user asks what is on their schedule, read it back and create nothing.',
     '',
@@ -253,14 +278,16 @@ function prettyWhen(ev: CalendarEvent): string {
 /* Tools                                                                      */
 /* -------------------------------------------------------------------------- */
 
-function buildTools(deps: AssistantDeps) {
+export function buildTools(deps: AssistantDeps) {
   const cals = () => deps.getCalendars();
 
   const listEvents = betaTool({
     name: 'list_events',
     description:
       'List every event between two dates, inclusive. Use this to answer questions ' +
-      'about the schedule and to check for conflicts before creating something.',
+      'about the schedule and to check for conflicts before creating something. ' +
+      'Returns { events, truncated? } — when `truncated` is present you are NOT ' +
+      'seeing everything in that range.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -275,12 +302,29 @@ function buildTools(deps: AssistantDeps) {
       const to = parseModelDate(end_date, true);
       // Repeating events are expanded here, so what the model sees over a range
       // is what the user sees on the grid — one entry per occurrence, each with
-      // an id that can be edited on its own.
+      // an id that can be edited on its own. That also means a wide range is
+      // unbounded: one daily event covers a year in 365 entries, which is why
+      // this is capped rather than returned whole.
       const hits = expandEvents(deps.getEvents(), from, to)
         .filter((ev) => parse(ev.start) <= to && parse(ev.end) >= from)
         .sort((a, b) => a.start.localeCompare(b.start));
+      const shown = hits.slice(0, LIST_LIMIT);
+
       deps.onAction(`Read ${start_date} → ${end_date} (${hits.length} event${hits.length === 1 ? '' : 's'})`);
-      return JSON.stringify(hits.map((ev) => summarize(ev, cals())));
+      return JSON.stringify({
+        events: shown.map((ev) => summarize(ev, cals())),
+        ...(hits.length > shown.length
+          ? {
+              truncated: {
+                shown: shown.length,
+                matching: hits.length,
+                advice:
+                  'This is a partial answer. Ask for a shorter range rather than ' +
+                  'acting as though this were the whole calendar.',
+              },
+            }
+          : {}),
+      });
     },
   });
 
@@ -289,12 +333,18 @@ function buildTools(deps: AssistantDeps) {
     description:
       'Search events by title, location, or description text. Use this to resolve a ' +
       'reference like "my dentist appointment" into an event id before updating or ' +
-      'deleting it.',
+      'deleting it, and to gather up every copy of something. Returns ' +
+      '{ matches, shown, total } — when `shown` is less than `total` there are ' +
+      'more than you can see, so raise `limit` before concluding anything about ' +
+      '"all" of them.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Words to look for. Case-insensitive.' },
-        limit: { type: 'integer', description: 'Maximum results. Defaults to 10.' },
+        limit: {
+          type: 'integer',
+          description: `Maximum results. Defaults to ${FIND_LIMIT}, up to ${FIND_MAX}.`,
+        },
       },
       required: ['query'],
       additionalProperties: false,
@@ -314,10 +364,29 @@ function buildTools(deps: AssistantDeps) {
           return { ev, score };
         })
         .filter((r) => r.score > 0)
-        .sort((a, b) => b.score - a.score || a.ev.start.localeCompare(b.ev.start))
-        .slice(0, limit ?? 10);
-      deps.onAction(`Searched for "${query}" (${scored.length} match${scored.length === 1 ? '' : 'es'})`);
-      return JSON.stringify(scored.map((r) => summarize(r.ev, cals())));
+        .sort((a, b) => b.score - a.score || a.ev.start.localeCompare(b.ev.start));
+
+      const cap = Math.max(1, Math.min(FIND_MAX, limit ?? FIND_LIMIT));
+      const shown = scored.slice(0, cap);
+
+      deps.onAction(
+        `Searched for "${query}" (${scored.length} match${scored.length === 1 ? '' : 'es'}` +
+          `${shown.length < scored.length ? `, showing ${shown.length}` : ''})`,
+      );
+      // Reporting the total alongside the page is what stops "delete the
+      // duplicates" from quietly finishing after the first ten of them.
+      return JSON.stringify({
+        matches: shown.map((r) => summarize(r.ev, cals())),
+        shown: shown.length,
+        total: scored.length,
+        ...(shown.length < scored.length
+          ? {
+              advice:
+                `Only ${shown.length} of ${scored.length} matches are listed. Call ` +
+                'again with a higher limit before telling the user you have them all.',
+            }
+          : {}),
+      });
     },
   });
 
@@ -536,10 +605,20 @@ function buildTools(deps: AssistantDeps) {
       const scope = scopeOf(wanted);
       const before = deps.getEvents();
 
-      const found = ids
-        .map((id) => ({ id, event: resolveEvent(before, id) }))
-        .filter((t): t is { id: string; event: CalendarEvent } => t.event !== null);
-      const missing = ids.filter((id) => !found.some((t) => t.id === id));
+      // Several ids can name the same thing. Five occurrence ids of one weekly
+      // series are five events on the grid, but deleting the series is one act —
+      // and doing it five times would report five deletions that never happened.
+      const seen = new Set<string>();
+      const found: { id: string; event: CalendarEvent }[] = [];
+      for (const id of ids) {
+        const event = resolveEvent(before, id);
+        if (!event) continue;
+        const unit = scope === 'this' ? id : event.recurrenceId ?? event.id;
+        if (seen.has(unit)) continue;
+        seen.add(unit);
+        found.push({ id, event });
+      }
+      const missing = ids.filter((id) => !resolveEvent(before, id));
 
       if (found.length === 0) {
         return JSON.stringify({
@@ -552,29 +631,50 @@ function buildTools(deps: AssistantDeps) {
       for (const { id } of found) deps.deleteEvent(id, scope);
 
       const gone = found.map((t) => t.event);
-      const repeating = gone.filter((e) => describeEvent(e));
-      const label =
-        gone.length === 1
-          ? `Deleted "${gone[0].title}" — ${prettyWhen(gone[0])}`
-          : `Deleted ${gone.length} events`;
-      const extent =
-        repeating.length > 0 && scope !== 'this'
-          ? scope === 'all'
-            ? ' and every occurrence of them'
-            : ' and every later occurrence'
-          : '';
+      // A repeating event only counts as a series when the scope reaches past
+      // the one occurrence named.
+      const series = scope === 'this' ? [] : gone.filter((e) => describeEvent(e));
+      const singles = gone.length - series.length;
+      const reach = scope === 'following' ? 'and every later occurrence' : 'and every repeat of it';
 
-      deps.onAction(`${label}${extent}`);
+      let label: string;
+      if (gone.length === 1) {
+        label = series.length
+          ? `Deleted "${gone[0].title}" ${reach}`
+          : `Deleted "${gone[0].title}" — ${prettyWhen(gone[0])}`;
+      } else {
+        const parts = [];
+        if (singles > 0) parts.push(`${singles} event${singles === 1 ? '' : 's'}`);
+        if (series.length > 0) {
+          parts.push(`${series.length} repeating event${series.length === 1 ? '' : 's'} ${reach}`);
+        }
+        label = `Deleted ${parts.join(' and ')}`;
+      }
+
+      deps.onAction(label);
       // Handing back both snapshots lets one Undo reverse the whole call, which
       // matters most when it removed more than the user expected.
       deps.onUndoable(before, deps.getEvents(), label);
 
       return JSON.stringify({
-        deleted: gone.map((e) => ({ id: e.id, title: e.title, when: prettyWhen(e) })),
+        deleted: gone.map((e) => ({
+          id: e.id,
+          title: e.title,
+          when: prettyWhen(e),
+          ...(series.includes(e) ? { removed: 'the whole repeating event' } : {}),
+        })),
         scope,
         undo_offered: true,
+        ...(seen.size < ids.length - missing.length
+          ? {
+              note:
+                'Some of those ids were occurrences of the same repeating event, so ' +
+                'they were removed once rather than one per id. Say what actually ' +
+                'went, not how many ids you sent.',
+            }
+          : {}),
         ...(missing.length > 0
-          ? { not_found: missing, note: 'These were already gone; say so only if it matters.' }
+          ? { not_found: missing, note_missing: 'These were already gone; mention only if it matters.' }
           : {}),
       });
     },

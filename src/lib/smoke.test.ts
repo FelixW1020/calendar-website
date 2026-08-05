@@ -505,6 +505,108 @@ console.log('\nediting a series');
   }
 }
 
+console.log('\nassistant tools');
+{
+  (globalThis as unknown as { localStorage: Storage }).localStorage = {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+    clear: () => {},
+    key: () => null,
+    length: 0,
+  };
+  const { useStore } = await import('../store');
+  const { buildTools } = await import('./assistant');
+
+  const s = () => useStore.getState();
+  const log: string[] = [];
+  const tools = buildTools({
+    getEvents: () => s().events,
+    getCalendars: () => s().calendars,
+    createEvent: (e) => s().createEvent(e),
+    updateEvent: (id, patch, scope) => s().updateEventScoped(id, patch, scope),
+    deleteEvent: (id, scope) => s().deleteEventScoped(id, scope),
+    confirm: async () => true,
+    onAction: (line) => log.push(line),
+    onUndoable: () => {},
+    onEventTouched: () => {},
+  });
+  // The tools are a union of differently-typed runnables; for the test they are
+  // just things with a name and a run.
+  const runnable = tools as unknown as { name: string; run: (i: unknown) => Promise<string> }[];
+  const call = async (name: string, input: unknown) =>
+    JSON.parse(String(await runnable.find((t) => t.name === name)!.run(input)));
+
+  const on = (dayOfMonth: number, hour: number) => toLocalISO(new Date(2026, 7, dayOfMonth, hour));
+  const add = (title: string, dayOfMonth: number, hour: number, rrule?: string) =>
+    s().createEvent({
+      title,
+      start: on(dayOfMonth, hour),
+      end: on(dayOfMonth, hour + 1),
+      allDay: false,
+      calendarId: 'personal',
+      ...(rrule ? { recurrence: rrule } : {}),
+    });
+
+  {
+    // The mess the old assistant left behind: it could not repeat an event, so
+    // "gym every Monday" became a run of concrete copies — twice over, here.
+    useStore.setState({ events: [] });
+    for (let i = 0; i < 16; i++) add('Gym', 3 + i, 7);
+
+    const partial = await call('find_events', { query: 'gym', limit: 10 });
+    assert.equal(partial.matches.length, 10);
+    assert.equal(partial.total, 16, 'the total is reported even when the page is short');
+    assert.ok(partial.advice, 'a short page says so rather than reading as the whole answer');
+
+    const full = await call('find_events', { query: 'gym' });
+    assert.equal(full.matches.length, 16, 'the default page holds an ordinary pile of duplicates');
+    assert.equal(full.shown, full.total);
+    assert.equal(full.advice, undefined);
+    ok('a partial search says how much it is holding back');
+  }
+  {
+    // All of them go in one call, and the calendar is actually clean after it.
+    const ids = (await call('find_events', { query: 'gym' })).matches.map((m: { id: string }) => m.id);
+    const out = await call('delete_events', { ids });
+    assert.equal(out.deleted.length, 16);
+    assert.deepEqual(s().events, [], 'nothing is left behind for a second round');
+    ok('every duplicate goes in a single delete');
+  }
+  {
+    // Five occurrence ids of one weekly series are five things on the grid and
+    // one thing to delete. Reporting five would be a lie.
+    useStore.setState({ events: [] });
+    add('Standup', 3, 9, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR');
+    const week = await call('list_events', { start_date: '2026-08-03', end_date: '2026-08-07' });
+    assert.equal(week.events.length, 5);
+
+    const out = await call('delete_events', {
+      ids: week.events.map((e: { id: string }) => e.id),
+    });
+    assert.equal(out.deleted.length, 1, 'one series, however many ids named it');
+    assert.equal(out.deleted[0].removed, 'the whole repeating event');
+    assert.ok(log.at(-1)?.includes('every repeat of it'), `said "${log.at(-1)}"`);
+    assert.deepEqual(s().events, []);
+    ok('occurrence ids of one series delete it once, and say so');
+  }
+  {
+    // Expanding a repeat makes a wide range unbounded, so it has to be capped —
+    // and a cap the model cannot see reads as "that is everything".
+    useStore.setState({ events: [] });
+    add('Daily thing', 1, 8, 'FREQ=DAILY');
+    const wide = await call('list_events', { start_date: '2026-01-01', end_date: '2029-12-31' });
+    assert.ok(wide.events.length <= 200, `capped, got ${wide.events.length}`);
+    assert.ok(wide.truncated.matching > wide.truncated.shown);
+    assert.ok(wide.truncated.advice.includes('partial'));
+
+    const narrow = await call('list_events', { start_date: '2026-08-03', end_date: '2026-08-07' });
+    assert.equal(narrow.events.length, 5);
+    assert.equal(narrow.truncated, undefined, 'an ordinary week is never truncated');
+    ok('a range too wide to answer whole says it is partial');
+  }
+}
+
 console.log('\ngeocode');
 {
   assert.equal(isMeetingLink('https://zoom.us/j/123'), true);
