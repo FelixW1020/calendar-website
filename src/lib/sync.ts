@@ -552,8 +552,21 @@ export async function signIn(email: string): Promise<void> {
   throw error;
 }
 
-/** Supabase's minimum is 6; a password typed roughly once per device can afford more. */
-export const MIN_PASSWORD_LENGTH = 8;
+/**
+ * What this app will send. The project has its own minimum on top — 6 by
+ * default, set under Authentication → Providers → Email — and the server is the
+ * one that decides, so anything shorter than that comes back as `weak_password`
+ * however low this goes.
+ */
+export const MIN_PASSWORD_LENGTH = 4;
+
+/** The project rejected the password as too weak, whatever this client allowed. */
+export class WeakPasswordError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WeakPasswordError';
+  }
+}
 
 /** The address and password together match no account here. */
 export class BadCredentialsError extends Error {
@@ -590,7 +603,13 @@ export async function signInWithPassword(email: string, password: string): Promi
 export async function setPassword(password: string): Promise<void> {
   if (!supabase) throw new Error('Sync is not configured.');
   const { error } = await supabase.auth.updateUser({ password });
-  if (error) throw error;
+  if (!error) return;
+  // Passed through rather than reworded: the project's own rule is the one that
+  // just refused, and only its own message says what that rule is.
+  if (isAuthApiError(error) && error.code === 'weak_password') {
+    throw new WeakPasswordError(error.message);
+  }
+  throw error;
 }
 
 export async function signOut(): Promise<void> {
