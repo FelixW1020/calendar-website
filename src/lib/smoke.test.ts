@@ -31,6 +31,7 @@ import {
   significantTokens,
   tokenize,
 } from './geocode';
+import { normalizeFeedUrl, parseICS, parseIcsDuration, readRule } from './ics';
 import type { CalendarEvent } from '../types';
 
 let n = 0;
@@ -726,6 +727,223 @@ console.log('\nplace matching');
   assert.ok(m('apple store fifth avenue', 'Apple Fifth Avenue, 767 5th Avenue, New York, NY'));
   assert.equal(m('duke chapel durham', 'Duke Chapel, Mt Ararat Road, Henderson, Tennessee'), null);
   ok('an extra descriptive word is tolerated, a wrong city is not');
+}
+
+console.log('\nics');
+
+/** A feed body, written the way a publisher would fold and terminate it. */
+const feed = (...lines: string[]) =>
+  ['BEGIN:VCALENDAR', 'VERSION:2.0', ...lines, 'END:VCALENDAR'].join('\r\n');
+
+const vevent = (...lines: string[]) => ['BEGIN:VEVENT', ...lines, 'END:VEVENT'];
+
+{
+  const parsed = parseICS(
+    feed(
+      'X-WR-CALNAME:Duke Holidays',
+      ...vevent(
+        'UID:a@example.com',
+        'SUMMARY:Board meeting',
+        'DTSTART:20260805T130500',
+        'DTEND:20260805T143000',
+      ),
+    ),
+    'cal1',
+  );
+  const [ev] = parsed.events;
+  assert.equal(parsed.name, 'Duke Holidays');
+  assert.equal(parsed.events.length, 1);
+  assert.equal(ev.title, 'Board meeting');
+  assert.equal(ev.calendarId, 'cal1');
+  assert.equal(ev.readOnly, true);
+  // No zone at all is a floating time: the same clock reading wherever it is read.
+  assert.deepEqual(parse(ev.start), new Date(2026, 7, 5, 13, 5, 0));
+  assert.deepEqual(parse(ev.end), new Date(2026, 7, 5, 14, 30, 0));
+  ok('a plain VEVENT becomes a read-only event at its floating wall time');
+}
+{
+  // 75-octet folding: a continuation is marked by one leading space, which is
+  // not part of the value.
+  const parsed = parseICS(
+    feed(...vevent('UID:b', 'SUMMARY:A title long enough to be', '  folded', 'DTSTART:20260805T090000')),
+    'cal1',
+  );
+  assert.equal(parsed.events[0].title, 'A title long enough to be folded');
+  ok('folded lines are joined without eating a space');
+}
+{
+  const parsed = parseICS(
+    feed(
+      ...vevent(
+        'UID:c',
+        'SUMMARY:Lunch\\, with a comma',
+        'DESCRIPTION:First line\\nSecond line\\; semicolon',
+        'DTSTART:20260805T120000',
+      ),
+    ),
+    'cal1',
+  );
+  assert.equal(parsed.events[0].title, 'Lunch, with a comma');
+  assert.equal(parsed.events[0].description, 'First line\nSecond line; semicolon');
+  ok('escaped commas, semicolons and newlines are unescaped');
+}
+{
+  // An all-day DTEND is exclusive; this calendar stores the last day it covers.
+  const parsed = parseICS(
+    feed(
+      ...vevent('UID:d', 'SUMMARY:Conference', 'DTSTART;VALUE=DATE:20260805', 'DTEND;VALUE=DATE:20260808'),
+    ),
+    'cal1',
+  );
+  const [ev] = parsed.events;
+  assert.equal(ev.allDay, true);
+  assert.deepEqual(parse(ev.start), new Date(2026, 7, 5, 0, 0, 0));
+  assert.deepEqual(parse(ev.end), new Date(2026, 7, 7, 23, 59, 0));
+  ok('an exclusive all-day DTEND becomes an inclusive last day');
+}
+{
+  // A one-day all-day event has no DTEND at all in some feeds.
+  const parsed = parseICS(feed(...vevent('UID:e', 'SUMMARY:Holiday', 'DTSTART;VALUE=DATE:20260704')), 'cal1');
+  assert.deepEqual(parse(parsed.events[0].end), new Date(2026, 6, 4, 23, 59, 0));
+  ok('an all-day event with no end covers its own day');
+}
+{
+  const parsed = parseICS(
+    feed(...vevent('UID:f', 'SUMMARY:Sync', 'DTSTART:20260805T130000Z', 'DTEND:20260805T140000Z')),
+    'cal1',
+  );
+  // Asserted as an instant, so the check holds wherever the test is run.
+  assert.equal(parse(parsed.events[0].start).getTime(), Date.UTC(2026, 7, 5, 13, 0, 0));
+  ok('a UTC DTSTART lands on the right instant');
+}
+{
+  const parsed = parseICS(
+    feed(
+      ...vevent('UID:g', 'SUMMARY:Summer', 'DTSTART;TZID=America/New_York:20260805T130500'),
+      ...vevent('UID:h', 'SUMMARY:Winter', 'DTSTART;TZID=America/New_York:20260105T130500'),
+    ),
+    'cal1',
+  );
+  // The offset has to be the one in force on that date: −4 in August, −5 in
+  // January. A single fixed offset would put one of these an hour out.
+  assert.equal(parse(parsed.events[0].start).getTime(), Date.UTC(2026, 7, 5, 17, 5, 0));
+  assert.equal(parse(parsed.events[1].start).getTime(), Date.UTC(2026, 0, 5, 18, 5, 0));
+  ok('a zoned time uses the offset in force on its own date');
+}
+{
+  const parsed = parseICS(
+    feed(...vevent('UID:i', 'SUMMARY:Standup', 'DTSTART:20260805T090000', 'DURATION:PT1H30M')),
+    'cal1',
+  );
+  assert.deepEqual(parse(parsed.events[0].end), new Date(2026, 7, 5, 10, 30, 0));
+  assert.equal(parseIcsDuration('P1DT2H'), 93_600_000);
+  assert.equal(parseIcsDuration('-PT15M'), -900_000);
+  assert.equal(parseIcsDuration('nonsense'), null);
+  ok('DURATION stands in for a missing DTEND');
+}
+{
+  // A VALARM sits inside the VEVENT and carries properties of the same names.
+  const parsed = parseICS(
+    feed(
+      ...vevent(
+        'UID:j',
+        'SUMMARY:Dentist',
+        'DTSTART:20260805T090000',
+        'BEGIN:VALARM',
+        'TRIGGER:-PT15M',
+        'DESCRIPTION:Reminder from the alarm',
+        'END:VALARM',
+      ),
+    ),
+    'cal1',
+  );
+  assert.equal(parsed.events[0].title, 'Dentist');
+  assert.equal(parsed.events[0].description, undefined);
+  ok("a VALARM's properties stay inside it");
+}
+{
+  const parsed = parseICS(
+    feed(
+      ...vevent('UID:k', 'SUMMARY:Kept', 'DTSTART:20260805T090000'),
+      ...vevent('UID:l', 'SUMMARY:Called off', 'DTSTART:20260806T090000', 'STATUS:CANCELLED'),
+    ),
+    'cal1',
+  );
+  assert.deepEqual(parsed.events.map((e) => e.title), ['Kept']);
+  ok('a cancelled event is not drawn');
+}
+{
+  const seed = new Date(2026, 7, 5, 9, 0, 0);
+  assert.equal(readRule('FREQ=WEEKLY;BYDAY=MO,WE', seed), 'FREQ=WEEKLY;BYDAY=MO,WE');
+  // UNTIL is a UTC instant and this calendar reads it as a local date, so an
+  // hour that belongs to the previous day locally has to be converted rather
+  // than truncated. West of Greenwich this is the 31st, not the 1st.
+  const instant = new Date(Date.UTC(2026, 8, 1, 3, 59, 59));
+  const pad = (v: number) => String(v).padStart(2, '0');
+  assert.equal(
+    readRule('FREQ=DAILY;UNTIL=20260901T035959Z', seed),
+    `FREQ=DAILY;UNTIL=${instant.getFullYear()}${pad(instant.getMonth() + 1)}${pad(instant.getDate())}`,
+  );
+  // Rules this calendar would draw in the wrong places lose the repeat instead.
+  assert.equal(readRule('FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-1', seed), undefined);
+  assert.equal(readRule('FREQ=HOURLY;INTERVAL=2', seed), undefined);
+  ok('unsupported rules are dropped rather than approximated');
+}
+{
+  // A series, one occurrence removed and one replaced — the three pieces the
+  // expander has to see as one thing.
+  const parsed = parseICS(
+    feed(
+      ...vevent(
+        'UID:m',
+        'SUMMARY:Weekly sync',
+        'DTSTART:20260803T100000',
+        'DTEND:20260803T103000',
+        'RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4',
+        'EXDATE:20260810T100000',
+      ),
+      ...vevent(
+        'UID:m',
+        'RECURRENCE-ID:20260817T100000',
+        'SUMMARY:Weekly sync (moved)',
+        'DTSTART:20260817T140000',
+        'DTEND:20260817T143000',
+      ),
+    ),
+    'cal1',
+  );
+  const master = parsed.events.find((e) => e.recurrence)!;
+  const override = parsed.events.find((e) => e.recurrenceId)!;
+  assert.equal(master.id, 'cal1:m');
+  assert.equal(override.recurrenceId, 'cal1:m');
+  assert.deepEqual(master.exdates, [toLocalISO(new Date(2026, 7, 10, 10, 0, 0))]);
+
+  const shown = expandEvents(parsed.events, new Date(2026, 7, 1), new Date(2026, 7, 31))
+    .sort((a, b) => a.start.localeCompare(b.start));
+  assert.deepEqual(
+    shown.map((e) => `${format(parse(e.start), 'MMM d HH:mm')} ${e.title}`),
+    ['Aug 3 10:00 Weekly sync', 'Aug 17 14:00 Weekly sync (moved)', 'Aug 24 10:00 Weekly sync'],
+  );
+  ok('a feed series expands with its exception and its override');
+}
+{
+  // Two feeds are free to use the same UID; the calendar id keeps them apart.
+  const body = feed(...vevent('UID:same', 'SUMMARY:Mine', 'DTSTART:20260805T090000'));
+  assert.notEqual(parseICS(body, 'cal1').events[0].id, parseICS(body, 'cal2').events[0].id);
+  // `~` separates a master from an occurrence everywhere else in the app.
+  const tilde = parseICS(feed(...vevent('UID:a~b', 'SUMMARY:X', 'DTSTART:20260805T090000')), 'cal1');
+  assert.ok(!tilde.events[0].id.includes('~'));
+  ok('feed ids are namespaced and never look like occurrence ids');
+}
+{
+  assert.equal(
+    normalizeFeedUrl('webcal://p01.icloud.com/published/2/abc'),
+    'https://p01.icloud.com/published/2/abc',
+  );
+  assert.equal(normalizeFeedUrl('example.com/cal.ics'), 'https://example.com/cal.ics');
+  assert.equal(normalizeFeedUrl('javascript:alert(1)'), null);
+  assert.equal(normalizeFeedUrl('   '), null);
+  ok('webcal links are rewritten and non-http schemes refused');
 }
 
 console.log(`\n${n} checks passed\n`);

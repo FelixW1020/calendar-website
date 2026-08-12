@@ -56,10 +56,27 @@ create index if not exists events_user_series_idx
 create index if not exists events_user_start_idx
   on public.events (user_id, starts_at);
 
+-- Calendars subscribed to by link. Only the address travels: the events behind
+-- it belong to whoever publishes them, and each device fetches its own copy
+-- rather than pushing thousands of read-only rows through here. `id` matches a
+-- row in `calendars`, which is where the name, colour and visibility live.
+create table if not exists public.subscriptions (
+  id          text        not null,
+  user_id     uuid        not null references auth.users (id) on delete cascade,
+  url         text        not null,
+  -- Whether this feed has to be read through the public relay because the
+  -- publisher sends no CORS headers. A per-feed decision the user makes.
+  use_proxy   boolean     not null default false,
+  updated_at  timestamptz not null default now(),
+  deleted_at  timestamptz,
+  primary key (user_id, id)
+);
+
 -- Row-level security: every row is reachable only by the user who owns it.
 -- Without this, the anon key would expose everyone's calendar.
-alter table public.calendars enable row level security;
-alter table public.events    enable row level security;
+alter table public.calendars     enable row level security;
+alter table public.events        enable row level security;
+alter table public.subscriptions enable row level security;
 
 drop policy if exists "own calendars" on public.calendars;
 create policy "own calendars" on public.calendars
@@ -73,6 +90,25 @@ create policy "own events" on public.events
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
+drop policy if exists "own subscriptions" on public.subscriptions;
+create policy "own subscriptions" on public.subscriptions
+  for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
 -- Realtime, so a change on your phone shows up on your laptop immediately.
-alter publication supabase_realtime add table public.calendars;
-alter publication supabase_realtime add table public.events;
+-- Adding a table that is already published raises rather than doing nothing,
+-- which would make this script re-runnable only the first time.
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['calendars', 'events', 'subscriptions'] loop
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t
+    ) then
+      execute format('alter publication supabase_realtime add table public.%I', t);
+    end if;
+  end loop;
+end $$;

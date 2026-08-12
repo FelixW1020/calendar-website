@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type {
@@ -6,6 +7,7 @@ import type {
   ChatMessage,
   EventRestore,
   PendingConfirmation,
+  Subscription,
   ViewMode,
 } from './types';
 import { parse, toLocalISO } from './lib/dates';
@@ -52,7 +54,11 @@ export type LocalChange =
   | { kind: 'event.upsert'; event: CalendarEvent }
   | { kind: 'event.delete'; id: string }
   | { kind: 'calendar.upsert'; calendar: Calendar }
-  | { kind: 'calendar.delete'; id: string };
+  | { kind: 'calendar.delete'; id: string }
+  // The address of a subscribed feed, not its contents: every device fetches
+  // those for itself.
+  | { kind: 'subscription.upsert'; subscription: Subscription }
+  | { kind: 'subscription.delete'; id: string };
 
 let changeHandler: ((c: LocalChange) => void) | null = null;
 
@@ -208,6 +214,13 @@ interface State {
   // Persisted
   events: CalendarEvent[];
   calendars: Calendar[];
+  subscriptions: Subscription[];
+  /**
+   * The last copy fetched of each subscribed feed, by subscription id. Kept so
+   * a cold start draws them before the network answers, and deliberately local:
+   * these rows belong to the publisher, and every device can fetch its own.
+   */
+  feed: Record<string, CalendarEvent[]>;
   apiKey: string | null;
   theme: 'light' | 'dark';
 
@@ -242,9 +255,32 @@ interface State {
   toggleCalendar: (id: string) => void;
   removeCalendar: (id: string) => void;
 
+  /**
+   * Subscribe to a published feed, and give it a calendar to live on. The id is
+   * the caller's so it can parse the feed's events against it before committing
+   * to a subscription that might not work — and `fetchedAt` says the copy it
+   * already holds counts, so adding one does not immediately fetch it again.
+   */
+  addSubscription: (input: {
+    id: string;
+    url: string;
+    name: string;
+    color: string;
+    useProxy: boolean;
+    fetchedAt?: string;
+  }) => Subscription;
+  setSubscriptionProxy: (id: string, useProxy: boolean) => void;
+  /** Refresh bookkeeping. Local to this device, so it never reaches the server. */
+  setFeedStatus: (id: string, patch: { lastFetchedAt?: string; error: string | null }) => void;
+  setFeedEvents: (id: string, events: CalendarEvent[]) => void;
+
   // Applied from the server; deliberately do not emit back to the sync layer.
   setSync: (patch: Partial<SyncState>) => void;
-  replaceAll: (events: CalendarEvent[], calendars: Calendar[]) => void;
+  replaceAll: (
+    events: CalendarEvent[],
+    calendars: Calendar[],
+    subscriptions?: Subscription[],
+  ) => void;
   applyRemote: (change: LocalChange) => void;
 
   // UI actions
@@ -269,6 +305,8 @@ export const useStore = create<State>()(
     (set, get) => ({
       events: [],
       calendars: DEFAULT_CALENDARS,
+      subscriptions: [],
+      feed: {},
       apiKey: null,
       theme: 'light',
 
@@ -471,7 +509,12 @@ export const useStore = create<State>()(
         // original timestamp would lose the race and delete it all over again
         // on the next merge, so a restore counts as a write of its own.
         const stamp = toLocalISO(new Date());
-        const restored = r.restore.map((e) => ({ ...e, updatedAt: stamp }));
+        // Snapshots are taken over the merged view, so a feed that refreshed
+        // mid-turn could show up here. Putting one back would turn a borrowed
+        // event into an owned one and sync it.
+        const restored = r.restore
+          .filter((e) => !e.readOnly)
+          .map((e) => ({ ...e, updatedAt: stamp }));
         const gone = new Set(r.remove);
         const replaced = new Set(restored.map((e) => e.id));
 
@@ -502,17 +545,64 @@ export const useStore = create<State>()(
         // Its events go too, and each needs its own tombstone so other devices
         // do not resurrect them.
         const orphaned = get().events.filter((e) => e.calendarId === id);
-        set((s) => ({
-          calendars: s.calendars.filter((c) => c.id !== id),
-          events: s.events.filter((e) => e.calendarId !== id),
-        }));
+        const subscribed = get().subscriptions.some((s) => s.id === id);
+        set((s) => {
+          const { [id]: _dropped, ...feed } = s.feed;
+          return {
+            calendars: s.calendars.filter((c) => c.id !== id),
+            events: s.events.filter((e) => e.calendarId !== id),
+            subscriptions: s.subscriptions.filter((sub) => sub.id !== id),
+            feed,
+          };
+        });
         for (const ev of orphaned) emit({ kind: 'event.delete', id: ev.id });
+        // Cached feed events were never on the server, so there is nothing to
+        // tombstone for them — only the subscription itself.
+        if (subscribed) emit({ kind: 'subscription.delete', id });
         emit({ kind: 'calendar.delete', id });
       },
 
+      addSubscription: ({ id, url, name, color, useProxy, fetchedAt }) => {
+        const calendar: Calendar = { id, name, color, visible: true };
+        const subscription: Subscription = {
+          id,
+          url,
+          useProxy,
+          lastFetchedAt: fetchedAt ?? null,
+          error: null,
+        };
+        set((s) => ({
+          calendars: [...s.calendars, calendar],
+          subscriptions: [...s.subscriptions, subscription],
+        }));
+        emit({ kind: 'calendar.upsert', calendar });
+        emit({ kind: 'subscription.upsert', subscription });
+        return subscription;
+      },
+
+      setSubscriptionProxy: (id, useProxy) => {
+        set((s) => ({
+          subscriptions: s.subscriptions.map((sub) =>
+            sub.id === id ? { ...sub, useProxy } : sub,
+          ),
+        }));
+        const sub = get().subscriptions.find((s) => s.id === id);
+        if (sub) emit({ kind: 'subscription.upsert', subscription: sub });
+      },
+
+      setFeedStatus: (id, patch) =>
+        set((s) => ({
+          subscriptions: s.subscriptions.map((sub) =>
+            sub.id === id ? { ...sub, ...patch } : sub,
+          ),
+        })),
+
+      setFeedEvents: (id, events) => set((s) => ({ feed: { ...s.feed, [id]: events } })),
+
       setSync: (patch) => set((s) => ({ sync: { ...s.sync, ...patch } })),
 
-      replaceAll: (events, calendars) => set({ events, calendars }),
+      replaceAll: (events, calendars, subscriptions) =>
+        set(subscriptions ? { events, calendars, subscriptions } : { events, calendars }),
 
       applyRemote: (change) =>
         set((s) => {
@@ -527,11 +617,33 @@ export const useStore = create<State>()(
               const rest = s.calendars.filter((c) => c.id !== change.calendar.id);
               return { calendars: [...rest, change.calendar] };
             }
-            case 'calendar.delete':
+            case 'calendar.delete': {
+              const { [change.id]: _dropped, ...feed } = s.feed;
               return {
                 calendars: s.calendars.filter((c) => c.id !== change.id),
                 events: s.events.filter((e) => e.calendarId !== change.id),
+                subscriptions: s.subscriptions.filter((sub) => sub.id !== change.id),
+                feed,
               };
+            }
+            case 'subscription.upsert': {
+              const incoming = change.subscription;
+              const mine = s.subscriptions.find((sub) => sub.id === incoming.id);
+              // Refresh state is this device's own — a feed the other device
+              // just fetched still has to be fetched here — but it belongs to
+              // the address, so a repointed subscription starts over.
+              const keepsCache = mine && mine.url === incoming.url;
+              const merged: Subscription = keepsCache
+                ? { ...incoming, lastFetchedAt: mine.lastFetchedAt, error: mine.error }
+                : incoming;
+              return {
+                subscriptions: [...s.subscriptions.filter((sub) => sub.id !== merged.id), merged],
+              };
+            }
+            case 'subscription.delete': {
+              const { [change.id]: _dropped, ...feed } = s.feed;
+              return { subscriptions: s.subscriptions.filter((sub) => sub.id !== change.id), feed };
+            }
           }
         }),
 
@@ -572,6 +684,8 @@ export const useStore = create<State>()(
       partialize: (s) => ({
         events: s.events,
         calendars: s.calendars,
+        subscriptions: s.subscriptions,
+        feed: s.feed,
         apiKey: s.apiKey,
         theme: s.theme,
       }),
@@ -583,6 +697,45 @@ export const useStore = create<State>()(
 export function visibleEvents(events: CalendarEvent[], calendars: Calendar[]): CalendarEvent[] {
   const hidden = new Set(calendars.filter((c) => !c.visible).map((c) => c.id));
   return events.filter((e) => !hidden.has(e.calendarId));
+}
+
+/**
+ * The user's own events plus the cached copy of every subscribed feed — what
+ * the views draw and what the assistant reads. Feed events are read-only, and
+ * only ever reach the store's mutations by way of a guard that turns them away.
+ */
+export function mergeFeeds(
+  events: CalendarEvent[],
+  feed: Record<string, CalendarEvent[]>,
+): CalendarEvent[] {
+  const feeds = Object.values(feed);
+  if (feeds.length === 0) return events;
+  return [...events, ...feeds.flat()];
+}
+
+/**
+ * Selecting a freshly built array out of the store on every render would defeat
+ * zustand's equality check, so the two halves are selected separately and joined
+ * only when one of them actually changes.
+ */
+export function useAllEvents(): CalendarEvent[] {
+  const events = useStore((s) => s.events);
+  const feed = useStore((s) => s.feed);
+  return useMemo(() => mergeFeeds(events, feed), [events, feed]);
+}
+
+/** Everything the app currently knows about, for callers outside React. */
+export function allEvents(): CalendarEvent[] {
+  const { events, feed } = useStore.getState();
+  return mergeFeeds(events, feed);
+}
+
+/** The subscription a calendar is fed by, when it is fed by one. */
+export function subscriptionFor(
+  subscriptions: Subscription[],
+  calendarId: string,
+): Subscription | undefined {
+  return subscriptions.find((s) => s.id === calendarId);
 }
 
 export function calendarColor(calendars: Calendar[], id: string): string {

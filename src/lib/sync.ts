@@ -1,7 +1,13 @@
-import type { RealtimeChannel, Session } from '@supabase/supabase-js';
-import type { Calendar, CalendarEvent } from '../types';
+import { isAuthApiError, type RealtimeChannel, type Session } from '@supabase/supabase-js';
+import type { Calendar, CalendarEvent, Subscription } from '../types';
 import { onLocalChange, useStore, type LocalChange, type SyncState } from '../store';
-import { supabase, syncConfigured, type CalendarRow, type EventRow } from './supabase';
+import {
+  supabase,
+  syncConfigured,
+  type CalendarRow,
+  type EventRow,
+  type SubscriptionRow,
+} from './supabase';
 import { parse, toLocalISO } from './dates';
 
 /* -------------------------------------------------------------------------- */
@@ -78,6 +84,26 @@ function calendarToRow(c: Calendar, userId: string) {
   };
 }
 
+/**
+ * Only the address crosses the wire. When and whether this device last managed
+ * to read the feed is its own business — a laptop that has been shut for a week
+ * has to refetch whatever the phone did this morning.
+ */
+function rowToSubscription(r: SubscriptionRow): Subscription {
+  return { id: r.id, url: r.url, useProxy: r.use_proxy, lastFetchedAt: null, error: null };
+}
+
+function subscriptionToRow(s: Subscription, userId: string) {
+  return {
+    id: s.id,
+    user_id: userId,
+    url: s.url,
+    use_proxy: s.useProxy,
+    updated_at: new Date().toISOString(),
+    deleted_at: null,
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Engine                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -104,12 +130,20 @@ async function mergeOnSignIn(uid: string): Promise<void> {
   if (!supabase) return;
   setSync({ status: 'syncing', message: null });
 
-  const [{ data: eventRows, error: eErr }, { data: calRows, error: cErr }] = await Promise.all([
+  const [
+    { data: eventRows, error: eErr },
+    { data: calRows, error: cErr },
+    { data: subRows, error: sErr },
+  ] = await Promise.all([
     supabase.from('events').select('*').eq('user_id', uid),
     supabase.from('calendars').select('*').eq('user_id', uid),
+    supabase.from('subscriptions').select('*').eq('user_id', uid),
   ]);
   if (eErr) return fail('loading events', eErr);
   if (cErr) return fail('loading calendars', cErr);
+  // An older database has no subscriptions table. Everything else still syncs;
+  // subscribed calendars simply stay on the device that added them.
+  if (sErr) console.warn('[sync] subscriptions are not set up on the server:', sErr.message);
 
   const local = useStore.getState();
   const localEvents = new Map(local.events.map((e) => [e.id, e]));
@@ -152,6 +186,29 @@ async function mergeOnSignIn(uid: string): Promise<void> {
   const seenCals = new Set((calRows ?? []).map((r) => (r as CalendarRow).id));
   for (const c of local.calendars) if (!seenCals.has(c.id)) toPushCals.push(c);
 
+  // Subscriptions carry no per-device state worth reconciling, so the server's
+  // copy simply wins and anything it has never seen goes up.
+  const mergedSubs = new Map(local.subscriptions.map((s) => [s.id, s]));
+  const toPushSubs: Subscription[] = [];
+  for (const row of (subRows ?? []) as SubscriptionRow[]) {
+    if (row.deleted_at) {
+      mergedSubs.delete(row.id);
+      continue;
+    }
+    const mine = mergedSubs.get(row.id);
+    const theirs = rowToSubscription(row);
+    // Nothing changed for this device unless the address itself did, so the
+    // cached copy stays valid and does not need refetching.
+    mergedSubs.set(
+      row.id,
+      mine && mine.url === theirs.url
+        ? { ...theirs, lastFetchedAt: mine.lastFetchedAt, error: mine.error }
+        : theirs,
+    );
+  }
+  const seenSubs = new Set((subRows ?? []).map((r) => (r as SubscriptionRow).id));
+  for (const s of local.subscriptions) if (!seenSubs.has(s.id)) toPushSubs.push(s);
+
   // A calendar must exist before events can reference it.
   if (toPushCals.length > 0) {
     const { error } = await supabase
@@ -165,8 +222,16 @@ async function mergeOnSignIn(uid: string): Promise<void> {
       .upsert(toPushEvents.map((e) => eventToRow(e, uid)));
     if (error) return fail('uploading events', error);
   }
+  if (toPushSubs.length > 0 && !sErr) {
+    const { error } = await supabase
+      .from('subscriptions')
+      .upsert(toPushSubs.map((s) => subscriptionToRow(s, uid)));
+    if (error) return fail('uploading subscribed calendars', error);
+  }
 
-  useStore.getState().replaceAll([...mergedEvents.values()], [...mergedCals.values()]);
+  useStore
+    .getState()
+    .replaceAll([...mergedEvents.values()], [...mergedCals.values()], [...mergedSubs.values()]);
   setSync({ status: 'live', message: null });
 }
 
@@ -198,6 +263,10 @@ function keyOf(change: LocalChange): string {
       return `calendar:${change.calendar.id}`;
     case 'calendar.delete':
       return `calendar:${change.id}`;
+    case 'subscription.upsert':
+      return `subscription:${change.subscription.id}`;
+    case 'subscription.delete':
+      return `subscription:${change.id}`;
   }
 }
 
@@ -239,12 +308,17 @@ if (typeof window !== 'undefined') {
  * Our own writes come back over the realtime channel. Replacing the row we just
  * sent with an identical copy only costs a re-render, so each push records what
  * it wrote and the subscription skips the echo.
+ *
+ * Keyed by table as well as id: a subscribed calendar has a row in `calendars`
+ * and a row in `subscriptions` under the same id, and one would otherwise
+ * swallow the other's echo.
  */
 const echoes = new Map<string, string>();
 
-function isEcho(id: string, updatedAt: string | null): boolean {
-  if (!updatedAt || echoes.get(id) !== updatedAt) return false;
-  echoes.delete(id);
+function isEcho(table: string, id: string, updatedAt: string | null): boolean {
+  const key = `${table}:${id}`;
+  if (!updatedAt || echoes.get(key) !== updatedAt) return false;
+  echoes.delete(key);
   return true;
 }
 
@@ -256,7 +330,7 @@ async function push(change: LocalChange): Promise<void> {
     switch (change.kind) {
       case 'event.upsert': {
         const row = eventToRow(change.event, uid);
-        echoes.set(row.id, row.updated_at);
+        echoes.set(`events:${row.id}`, row.updated_at);
         const { error } = await supabase.from('events').upsert(row);
         if (error) throw error;
         break;
@@ -264,7 +338,7 @@ async function push(change: LocalChange): Promise<void> {
       case 'event.delete': {
         // Tombstone rather than delete, so other devices learn about it.
         const stamp = new Date().toISOString();
-        echoes.set(change.id, stamp);
+        echoes.set(`events:${change.id}`, stamp);
         const { error } = await supabase
           .from('events')
           .update({ deleted_at: stamp, updated_at: stamp })
@@ -275,16 +349,34 @@ async function push(change: LocalChange): Promise<void> {
       }
       case 'calendar.upsert': {
         const row = calendarToRow(change.calendar, uid);
-        echoes.set(row.id, row.updated_at);
+        echoes.set(`calendars:${row.id}`, row.updated_at);
         const { error } = await supabase.from('calendars').upsert(row);
         if (error) throw error;
         break;
       }
       case 'calendar.delete': {
         const stamp = new Date().toISOString();
-        echoes.set(change.id, stamp);
+        echoes.set(`calendars:${change.id}`, stamp);
         const { error } = await supabase
           .from('calendars')
+          .update({ deleted_at: stamp, updated_at: stamp })
+          .eq('user_id', uid)
+          .eq('id', change.id);
+        if (error) throw error;
+        break;
+      }
+      case 'subscription.upsert': {
+        const row = subscriptionToRow(change.subscription, uid);
+        echoes.set(`subscriptions:${row.id}`, row.updated_at);
+        const { error } = await supabase.from('subscriptions').upsert(row);
+        if (error) throw error;
+        break;
+      }
+      case 'subscription.delete': {
+        const stamp = new Date().toISOString();
+        echoes.set(`subscriptions:${change.id}`, stamp);
+        const { error } = await supabase
+          .from('subscriptions')
           .update({ deleted_at: stamp, updated_at: stamp })
           .eq('user_id', uid)
           .eq('id', change.id);
@@ -310,7 +402,7 @@ function subscribe(uid: string): void {
       { event: '*', schema: 'public', table: 'events', filter: `user_id=eq.${uid}` },
       (payload) => {
         const row = payload.new as EventRow | null;
-        if (!row?.id || isEcho(row.id, row.updated_at)) return;
+        if (!row?.id || isEcho('events', row.id, row.updated_at)) return;
         useStore
           .getState()
           .applyRemote(
@@ -325,13 +417,28 @@ function subscribe(uid: string): void {
       { event: '*', schema: 'public', table: 'calendars', filter: `user_id=eq.${uid}` },
       (payload) => {
         const row = payload.new as CalendarRow | null;
-        if (!row?.id || isEcho(row.id, row.updated_at)) return;
+        if (!row?.id || isEcho('calendars', row.id, row.updated_at)) return;
         useStore
           .getState()
           .applyRemote(
             row.deleted_at
               ? { kind: 'calendar.delete', id: row.id }
               : { kind: 'calendar.upsert', calendar: rowToCalendar(row) },
+          );
+      },
+    )
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'subscriptions', filter: `user_id=eq.${uid}` },
+      (payload) => {
+        const row = payload.new as SubscriptionRow | null;
+        if (!row?.id || isEcho('subscriptions', row.id, row.updated_at)) return;
+        useStore
+          .getState()
+          .applyRemote(
+            row.deleted_at
+              ? { kind: 'subscription.delete', id: row.id }
+              : { kind: 'subscription.upsert', subscription: rowToSubscription(row) },
           );
       },
     )
@@ -398,12 +505,91 @@ export function initSync(): () => void {
   };
 }
 
+/**
+ * Raised when an address has no account on this deployment.
+ *
+ * Its own type because it is not a failure: the site is published for anyone to
+ * use, but the database behind it belongs to one person. The dialog explains
+ * that, where Supabase's own wording ("Signups not allowed for otp") reads like
+ * something is broken.
+ */
+export class SyncNotOfferedError extends Error {
+  constructor() {
+    super('This deployment syncs one account.');
+    this.name = 'SyncNotOfferedError';
+  }
+}
+
+/**
+ * How Supabase says "no account here, and I am not creating one". Which of the
+ * three comes back depends on whether the refusal is the request's doing
+ * (`shouldCreateUser` below) or the project's sign-up switch.
+ */
+const NO_ACCOUNT_CODES = new Set(['otp_disabled', 'signup_disabled', 'user_not_found']);
+
 export async function signIn(email: string): Promise<void> {
   if (!supabase) throw new Error('Sync is not configured.');
   const { error } = await supabase.auth.signInWithOtp({
     email,
-    options: { emailRedirectTo: window.location.href },
+    options: {
+      emailRedirectTo: window.location.href,
+      /**
+       * The build is public; the Supabase project behind it is not shared. Left
+       * to itself, `signInWithOtp` creates an account for whoever asks, so
+       * anyone who found the URL could put their calendar in someone else's
+       * database. Turning sign-ups off in the dashboard is the half that
+       * actually enforces this — anyone can edit the flag out of the bundle —
+       * and this half is what lets the UI say so honestly instead of promising
+       * an email that will never arrive.
+       */
+      shouldCreateUser: false,
+    },
   });
+  if (!error) return;
+  if (isAuthApiError(error) && NO_ACCOUNT_CODES.has(error.code ?? '')) {
+    throw new SyncNotOfferedError();
+  }
+  throw error;
+}
+
+/** Supabase's minimum is 6; a password typed roughly once per device can afford more. */
+export const MIN_PASSWORD_LENGTH = 8;
+
+/** The address and password together match no account here. */
+export class BadCredentialsError extends Error {
+  constructor() {
+    super('That email and password do not match an account.');
+    this.name = 'BadCredentialsError';
+  }
+}
+
+/**
+ * Sign in with a password instead of an emailed link.
+ *
+ * The same account and the same session — what it saves is leaving the app to
+ * read an inbox, which is most of the friction of signing in on a phone. The
+ * check happens on Supabase's side, which is what makes it a lock rather than a
+ * suggestion: a code compared in the browser is readable by anyone who opens
+ * the page, and a limit on attempts kept in the browser resets on reload.
+ */
+export async function signInWithPassword(email: string, password: string): Promise<void> {
+  if (!supabase) throw new Error('Sync is not configured.');
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (!error) return;
+  if (isAuthApiError(error) && error.code === 'invalid_credentials') {
+    throw new BadCredentialsError();
+  }
+  throw error;
+}
+
+/**
+ * Give the signed-in account a password, or replace the one it has. Only
+ * reachable while signed in, so an emailed link is always what bootstraps a
+ * password rather than the other way round.
+ */
+export async function setPassword(password: string): Promise<void> {
+  if (!supabase) throw new Error('Sync is not configured.');
+  const { error } = await supabase.auth.updateUser({ password });
   if (error) throw error;
 }
 

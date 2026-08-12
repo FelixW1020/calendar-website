@@ -36,6 +36,12 @@ export interface CalendarEvent {
   recurrenceId?: string;
   /** On such an event: the occurrence start it stands in for. */
   originalStart?: string;
+  /**
+   * Came from a subscribed feed. It is drawn like any other event and is never
+   * editable — the publisher owns it, and the next refresh would overwrite
+   * anything done to it here.
+   */
+  readOnly?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -45,6 +51,26 @@ export interface Calendar {
   name: string;
   color: string;
   visible: boolean;
+}
+
+/**
+ * A calendar published elsewhere and read by link. The events themselves are
+ * cached locally and thrown away on every refresh; this record — which is what
+ * syncs between devices — is only the address they came from.
+ *
+ * `id` is also the id of the `Calendar` this feed's events belong to, so colour,
+ * visibility and the sidebar entry are the ordinary ones.
+ */
+export interface Subscription {
+  id: string;
+  /** Normalised to http(s); a `webcal:` link is rewritten on the way in. */
+  url: string;
+  /** Read via the public relay because the publisher blocks direct access. */
+  useProxy: boolean;
+  /** ISO of the last successful refresh, or null before the first one. */
+  lastFetchedAt: string | null;
+  /** Why the last refresh failed, or null when it worked. Per-device. */
+  error: string | null;
 }
 
 /**

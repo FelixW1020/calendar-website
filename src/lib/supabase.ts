@@ -61,3 +61,17 @@ export interface CalendarRow {
   updated_at: string;
   deleted_at: string | null;
 }
+
+/**
+ * A subscribed feed's address. Its events are not here — they are refetched per
+ * device from the publisher, so what syncs is the subscription, not the copy.
+ * `id` is shared with the calendar row that carries its name and colour.
+ */
+export interface SubscriptionRow {
+  id: string;
+  user_id: string;
+  url: string;
+  use_proxy: boolean;
+  updated_at: string;
+  deleted_at: string | null;
+}

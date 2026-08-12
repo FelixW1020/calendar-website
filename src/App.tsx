@@ -10,6 +10,7 @@ import AccountDialog from './components/AccountDialog';
 import { Sparkle } from './components/Icons';
 import { useStore } from './store';
 import { initSync } from './lib/sync';
+import { initFeeds } from './lib/feeds';
 import { daysIn, step, visibleRange } from './lib/dates';
 
 function isTyping(target: EventTarget | null): boolean {
@@ -46,6 +47,9 @@ export default function App() {
   // Restores the session, merges with the server, and starts realtime.
   // A no-op build without Supabase credentials stays local-only.
   useEffect(() => initSync(), []);
+
+  // Brings subscribed calendars up to date, on a schedule of their own.
+  useEffect(() => initFeeds(), []);
 
   // Keep the DOM class in sync with the persisted theme (the inline script in
   // index.html handles the very first paint).
