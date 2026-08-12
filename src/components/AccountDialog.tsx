@@ -5,6 +5,7 @@ import {
   BadCredentialsError,
   MIN_PASSWORD_LENGTH,
   SyncNotOfferedError,
+  WeakPasswordError,
   setPassword,
   signIn,
   signInWithPassword,
@@ -237,7 +238,16 @@ function PasswordSetter() {
       setDone(true);
       setOpen(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // The project keeps its own minimum, which this dialog cannot talk it out
+      // of — so say where it is set rather than leaving a bare refusal.
+      setError(
+        err instanceof WeakPasswordError
+          ? `${err.message} That rule belongs to the Supabase project, not this ` +
+            'page: Authentication → Providers → Email → Minimum password length.'
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
     } finally {
       setBusy(false);
     }
@@ -254,7 +264,10 @@ function PasswordSetter() {
 
   if (!open) {
     return (
-      <button onClick={() => setOpen(true)} className="text-xs text-ink-faint hover:text-ink">
+      <button
+        onClick={() => setOpen(true)}
+        className="w-full rounded-md border border-line py-2 text-sm text-ink-soft hover:text-ink"
+      >
         Set a password for quicker sign-in
       </button>
     );
@@ -264,8 +277,9 @@ function PasswordSetter() {
     <form onSubmit={save} className="space-y-2 rounded-lg border border-line p-3">
       <p className="text-[12px] leading-relaxed text-ink-faint">
         A password lets you sign in on a new device without waiting for an email. You type it once
-        per device — the session refreshes itself after that — so make it a real one and let your
-        password manager keep it.
+        per device — the session refreshes itself after that — so a longer one costs you almost
+        nothing, and a short one is the only thing standing between this calendar and anyone who
+        knows your address.
       </p>
       <input
         autoFocus
