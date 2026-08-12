@@ -193,6 +193,14 @@ function stableSystemPrompt(calendars: Calendar[]): string {
     '- Say which copy survived. "Removed 15 duplicate gyms, kept the Monday 7am',
     '  one" is the answer; "deleted the duplicates" is not.',
     '',
+    '## Subscribed calendars',
+    'Some calendars are read by link from somewhere else — a holiday feed, a team',
+    'schedule. Their events come back marked `read_only` and count for everything',
+    'you read: conflicts, "what am I doing Friday", finding a free slot. They',
+    'simply cannot be changed or deleted here. If asked to, say where it lives',
+    'instead of looking for another way, and go ahead with any part of the request',
+    'that does not touch one.',
+    '',
     '## Answering',
     'When the user asks what is on their schedule, read it back and create nothing.',
     '',
@@ -237,6 +245,9 @@ function summarize(ev: CalendarEvent, calendars: Calendar[]) {
     // Present on every occurrence of a series, so the model can see that an id
     // it is about to change belongs to one.
     ...(repeats ? { repeats, recurrence: ev.recurrence } : {}),
+    // Read from a subscribed calendar. Flagged here so a plan is made around it
+    // rather than discovered when the change is refused.
+    ...(ev.readOnly ? { read_only: true } : {}),
   };
 }
 
@@ -503,6 +514,14 @@ export function buildTools(deps: AssistantDeps) {
           error: `No event with id ${args.id}. Call find_events to get a current id.`,
         });
       }
+      if (existing.readOnly) {
+        return JSON.stringify({
+          error:
+            `"${existing.title}" is on a calendar subscribed to by link, which is ` +
+            'read-only here. It can only be changed where it is published. Say so ' +
+            'rather than trying another way.',
+        });
+      }
       const scope = scopeOf(args.scope);
       const repeats = Boolean(describeEvent(existing));
 
@@ -619,6 +638,23 @@ export function buildTools(deps: AssistantDeps) {
         found.push({ id, event });
       }
       const missing = ids.filter((id) => !resolveEvent(before, id));
+
+      // Events read from a subscribed feed cannot be deleted here — the next
+      // refresh would fetch them straight back. Refusing the whole call rather
+      // than quietly dropping them is what stops "clear my Friday" from
+      // reporting success over events that are all still there.
+      const subscribed = found.filter((t) => t.event.readOnly);
+      if (subscribed.length > 0) {
+        return JSON.stringify({
+          error:
+            `${subscribed.map((t) => `"${t.event.title}"`).join(', ')} ` +
+            `${subscribed.length === 1 ? 'is' : 'are'} on a calendar subscribed to by ` +
+            'link, which is read-only here. Nothing was deleted. Tell the user which ' +
+            'ones cannot be removed, and offer to delete the rest.',
+          read_only_ids: subscribed.map((t) => t.id),
+          deletable_ids: found.filter((t) => !t.event.readOnly).map((t) => t.id),
+        });
+      }
 
       if (found.length === 0) {
         return JSON.stringify({

@@ -153,6 +153,37 @@ single deletion and a single Undo rather than five of each.
 
 ---
 
+## Subscribing to someone else's calendar
+
+**Sidebar → Add by link** takes the iCal or `webcal` address of a calendar
+published somewhere else — a Google Calendar, a team schedule, a holiday list.
+Its events appear alongside yours, in their own colour, with their own checkbox
+to hide them. They refresh in the background every six hours, and hovering the
+calendar in the sidebar gives you a refresh button for right now.
+
+They are **read-only**. You cannot drag one, edit one, or ask the assistant to
+cancel one — the publisher owns them, and the next refresh would undo it anyway.
+The assistant does *read* them, so "what do I have Friday?" and its check for
+conflicts both see them. Clicking one shows the details and where it came from.
+
+**Most calendars need a relay, and that is worth understanding.** Google,
+iCloud and Outlook all serve iCalendar without the header a browser requires to
+read it from another site. This app has no server of its own to fetch it for
+you, so the only way through is a public relay — and this app is honest about
+it: it tries the address directly first, and only if that is blocked does it
+offer to use `api.allorigins.win`, per calendar, telling you what it costs.
+
+What it costs is real. The address *and everything in the calendar* passes
+through a stranger's server. For a public holiday feed that is nothing; for the
+"secret address" of your own Google Calendar, that link is a password, and
+anyone holding it can read your schedule. Decide accordingly. If you would
+rather not, the answer is to say no — the calendar is simply not added.
+
+The relay also goes down in bursts. A failed refresh leaves the last copy on
+screen and shows the reason under the calendar's name; it retries by itself.
+
+---
+
 ## Sync across devices
 
 Without setup, the calendar is saved in `localStorage`: it survives reloads on
@@ -164,10 +195,11 @@ open devices. It needs a Supabase project (free tier is plenty):
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. **SQL Editor → New query**, paste [`supabase/schema.sql`](supabase/schema.sql),
-   and run it. That creates the two tables, the row-level security policies, and
-   the realtime publication. It is safe to re-run, and you need to re-run it if
-   you set sync up before location pins existed — that is what adds the
-   coordinate columns.
+   and run it. That creates the tables, the row-level security policies, and the
+   realtime publication. It is safe to re-run, and you need to re-run it if you
+   set sync up before location pins existed (that is what adds the coordinate
+   columns) or before calendars could be subscribed to by link (that is what
+   adds the `subscriptions` table).
 3. **Project Settings → Data API**: copy the Project URL and the `anon` key.
 4. Local dev: `cp .env.example .env.local` and fill both in.
 5. Deployed: add them as repo variables so the build can see them —
@@ -178,9 +210,31 @@ open devices. It needs a Supabase project (free tier is plenty):
    then re-run the deploy (`gh workflow run "Deploy to GitHub Pages"`).
 6. Open the site, click the cloud icon in the header, and sign in with your
    email. Supabase sends a link — no password.
+7. **Authentication → Sign In / Providers → turn off "Allow new users to sign
+   up."** Do this *after* step 6, so your own account already exists. The build
+   is public, and without this anyone who finds the URL can create an account in
+   your project and store their calendar in your database. Your data stays
+   private either way — row-level security sees to that — but their rows would
+   be sitting in your project, on your quota.
+
+   The client asks for this too (`shouldCreateUser: false` in `signIn`), which
+   is what makes the dialog explain the situation rather than promise an email
+   that never arrives. That half is only cosmetic: anyone can edit a flag out of
+   a bundle they downloaded. The dashboard switch is the one that enforces it.
 
 The `anon` key is meant to be public; row-level security is what stops one
 account reading another's calendar. Never publish the `service_role` key.
+
+**What a visitor to your deployed site gets.** Everything except sync. Their
+events live in their own browser, the assistant runs on their own API key —
+which never touches your database, or anyone's; it goes straight from their
+browser to Anthropic — and subscribed calendars work normally. Nothing they do
+reaches your Supabase unless they sign in, and after step 7 they cannot.
+
+For a calendar subscribed by link, only the address syncs — subscribe on your
+laptop and your phone picks up the subscription and fetches the feed itself.
+The events are never uploaded: they are someone else's, and they would be
+thousands of read-only rows in your database for no benefit.
 
 **How it reconciles.** On sign-in, local and server state are merged by id, with
 the newer `updated_at` winning. Deletes are tombstones (`deleted_at`) rather
@@ -244,8 +298,10 @@ src/
     layout.ts        Overlapping-event column packing
     recurrence.ts    Repeat rules: parsing, expansion, exceptions, splitting
     geocode.ts       Place search, confident-match resolve, map + maps links
+    ics.ts           iCalendar parsing and fetching for subscribed calendars
+    feeds.ts         When those subscriptions refresh
     sync.ts          Supabase merge, write queue, realtime subscription
-    smoke.test.ts    Checks for dates, layout, recurrence, and geocode links
+    smoke.test.ts    Checks for dates, layout, recurrence, geocode links, and iCalendar
   components/
     TimeGrid.tsx        Day + week grid, drag/resize, current-time line
     MonthView.tsx       Month grid with "+N more"
@@ -256,6 +312,7 @@ src/
     LocationField.tsx   Location combobox, suggestions, map card
     Header.tsx          Navigation, search, view switcher, theme
     Sidebar.tsx         Mini month, calendar list, shortcuts
+    SubscribeDialog.tsx Add a calendar by link, and the relay disclosure
   store.ts           Zustand state, persisted to localStorage
 ```
 
@@ -291,7 +348,12 @@ date arithmetic starts slipping.
 
 ## Not built yet
 
-Google/CalDAV sync, ICS import/export, reminders, and sharing. Single timezone
-only. Repeat rules cover the common shapes (see **Repeating events** above) but
-not the whole of RFC 5545 — no BYSETPOS, BYWEEKNO, or several rules on one
-event.
+Google/CalDAV sync, ICS export, reminders, and sharing. Single timezone only.
+Repeat rules cover the common shapes (see **Repeating events** above) but not
+the whole of RFC 5545 — no BYSETPOS, BYWEEKNO, or several rules on one event.
+A subscribed calendar carrying a rule that shape is shown as a single event
+rather than repeated on the wrong days.
+
+Subscribing reads iCalendar in but never writes it back: it is one-way, and
+nothing you do here reaches the publisher. There is no file or paste import
+either — a calendar has to be reachable at an address.

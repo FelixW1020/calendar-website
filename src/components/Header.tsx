@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import type { ViewMode } from '../types';
-import { calendarColor, useStore, visibleEvents } from '../store';
+import { calendarColor, useAllEvents, useStore, visibleEvents } from '../store';
 import { format, parse, rangeLabel, step } from '../lib/dates';
 import { isSeriesEvent, nextOccurrence } from '../lib/recurrence';
 import { ChevronLeft, ChevronRight, Cloud, Menu, Moon, Repeat, Search, Sun } from './Icons';
@@ -216,7 +216,7 @@ export default function Header({ searchRef, onOpenMenu, onOpenAccount }: Props) 
 
 function SearchResults({ onPick }: { onPick: () => void }) {
   const search = useStore((s) => s.search);
-  const events = useStore((s) => s.events);
+  const events = useAllEvents();
   const calendars = useStore((s) => s.calendars);
   const setAnchor = useStore((s) => s.setAnchor);
   const select = useStore((s) => s.select);

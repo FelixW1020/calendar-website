@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { CalendarEvent } from '../types';
-import { calendarColor, useStore, visibleEvents } from '../store';
+import { calendarColor, useAllEvents, useStore, visibleEvents } from '../store';
 import { addDays, eventsOn, format, isSameDay, parse, startOfDay } from '../lib/dates';
 import { expandEvents, isSeriesEvent } from '../lib/recurrence';
 import { Repeat } from './Icons';
@@ -13,7 +13,7 @@ interface Props {
 const MAX_CHIPS = 3;
 
 export default function MonthView({ days, anchorMonth }: Props) {
-  const events = useStore((s) => s.events);
+  const events = useAllEvents();
   const calendars = useStore((s) => s.calendars);
   const select = useStore((s) => s.select);
   const setAnchor = useStore((s) => s.setAnchor);

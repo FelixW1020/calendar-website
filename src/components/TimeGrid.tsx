@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CalendarEvent } from '../types';
-import { calendarColor, useStore, visibleEvents } from '../store';
+import { calendarColor, useAllEvents, useStore, visibleEvents } from '../store';
 import {
   DAY_HEIGHT,
   HOUR_HEIGHT,
@@ -58,7 +58,7 @@ function hourLabel(h: number): string {
 }
 
 export default function TimeGrid({ days }: Props) {
-  const events = useStore((s) => s.events);
+  const events = useAllEvents();
   const calendars = useStore((s) => s.calendars);
   const selectedId = useStore((s) => s.selectedEventId);
   const select = useStore((s) => s.select);
@@ -176,7 +176,9 @@ export default function TimeGrid({ days }: Props) {
   }, [drag, days, updateEvent]);
 
   const beginMove = (e: React.PointerEvent, ev: CalendarEvent) => {
-    if (ev.allDay || e.button !== 0) return;
+    // An event from a subscribed feed belongs to whoever publishes it; the next
+    // refresh would put it back where it was.
+    if (ev.allDay || ev.readOnly || e.button !== 0) return;
     // On touch, a press on an event has to stay available for scrolling the
     // grid. Tap opens the editor instead; drag is a pointer-device gesture.
     if (e.pointerType === 'touch') return;
@@ -195,7 +197,7 @@ export default function TimeGrid({ days }: Props) {
   };
 
   const beginResize = (e: React.PointerEvent, ev: CalendarEvent, day: Date) => {
-    if (e.button !== 0 || e.pointerType === 'touch') return;
+    if (e.button !== 0 || e.pointerType === 'touch' || ev.readOnly) return;
     e.stopPropagation();
     movedRef.current = false;
     setDrag({
@@ -284,8 +286,9 @@ export default function TimeGrid({ days }: Props) {
             : undefined,
         }}
         className={
-          'event-chip absolute cursor-grab overflow-hidden rounded-md px-1.5 py-0.5 text-white ' +
-          'select-none transition-shadow active:cursor-grabbing ' +
+          'event-chip absolute overflow-hidden rounded-md px-1.5 py-0.5 text-white ' +
+          'select-none transition-shadow ' +
+          (ev.readOnly ? 'cursor-pointer ' : 'cursor-grab active:cursor-grabbing ') +
           (isDraft ? 'z-20 opacity-90 shadow-lg' : 'z-10')
         }
       >
@@ -301,10 +304,12 @@ export default function TimeGrid({ days }: Props) {
             </span>
           </div>
         )}
-        <div
-          onPointerDown={(e) => beginResize(e, ev, startOfDay(shownStart))}
-          className="absolute inset-x-0 bottom-0 h-2 cursor-ns-resize"
-        />
+        {!ev.readOnly && (
+          <div
+            onPointerDown={(e) => beginResize(e, ev, startOfDay(shownStart))}
+            className="absolute inset-x-0 bottom-0 h-2 cursor-ns-resize"
+          />
+        )}
       </div>
     );
   };

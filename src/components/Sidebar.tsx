@@ -1,14 +1,17 @@
 import { useState } from 'react';
-import { PALETTE, useStore } from '../store';
+import { PALETTE, subscriptionFor, useStore } from '../store';
 import {
   addDays,
   format,
   isSameDay,
+  parse,
   startOfWeek,
   visibleRange,
   WEEK_STARTS_ON,
 } from '../lib/dates';
-import { ChevronLeft, ChevronRight } from './Icons';
+import { refreshFeed } from '../lib/feeds';
+import { ChevronLeft, ChevronRight, Link, Refresh } from './Icons';
+import SubscribeDialog from './SubscribeDialog';
 
 interface Props {
   /** Drawer state, used below the lg breakpoint where the sidebar is off-canvas. */
@@ -21,6 +24,7 @@ export default function Sidebar({ open, onClose }: Props) {
   const view = useStore((s) => s.view);
   const setAnchor = useStore((s) => s.setAnchor);
   const calendars = useStore((s) => s.calendars);
+  const subscriptions = useStore((s) => s.subscriptions);
   const toggleCalendar = useStore((s) => s.toggleCalendar);
   const addCalendar = useStore((s) => s.addCalendar);
   const removeCalendar = useStore((s) => s.removeCalendar);
@@ -28,6 +32,8 @@ export default function Sidebar({ open, onClose }: Props) {
   const [miniMonth, setMiniMonth] = useState(() => new Date(anchor));
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState('');
+  const [subscribing, setSubscribing] = useState(false);
+  const [refreshing, setRefreshing] = useState<string | null>(null);
 
   const range = visibleRange(anchor, view);
   const gridStart = startOfWeek(new Date(miniMonth.getFullYear(), miniMonth.getMonth(), 1), {
@@ -120,30 +126,70 @@ export default function Sidebar({ open, onClose }: Props) {
           Calendars
         </div>
         <ul className="space-y-0.5">
-          {calendars.map((c) => (
-            <li key={c.id} className="group flex items-center gap-2 rounded px-1 py-1">
-              <input
-                type="checkbox"
-                checked={c.visible}
-                onChange={() => toggleCalendar(c.id)}
-                aria-label={c.name}
-                style={{ accentColor: c.color }}
-                className="h-3.5 w-3.5 shrink-0"
-              />
-              <span className="min-w-0 flex-1 truncate text-sm text-ink">{c.name}</span>
-              {calendars.length > 1 && (
-                <button
-                  onClick={() => {
-                    if (confirm(`Delete "${c.name}" and all of its events?`)) removeCalendar(c.id);
-                  }}
-                  aria-label={`Delete ${c.name}`}
-                  className="opacity-0 transition group-hover:opacity-100 text-ink-faint hover:text-red-600"
-                >
-                  <span className="text-xs">×</span>
-                </button>
-              )}
-            </li>
-          ))}
+          {calendars.map((c) => {
+            const feed = subscriptionFor(subscriptions, c.id);
+            return (
+              <li key={c.id} className="group rounded px-1 py-1">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={c.visible}
+                    onChange={() => toggleCalendar(c.id)}
+                    aria-label={c.name}
+                    style={{ accentColor: c.color }}
+                    className="h-3.5 w-3.5 shrink-0"
+                  />
+                  <span className="flex min-w-0 flex-1 items-center gap-1 text-sm text-ink">
+                    <span className="truncate">{c.name}</span>
+                    {/* The badge for a subscribed calendar. The sidebar is too
+                        narrow for the word, so the address lives in the tooltip. */}
+                    {feed && (
+                      <span title={feed.url} className="shrink-0 text-ink-faint">
+                        <Link className="h-3 w-3" />
+                      </span>
+                    )}
+                  </span>
+                  {feed && (
+                    <button
+                      onClick={async () => {
+                        setRefreshing(c.id);
+                        await refreshFeed(c.id, { force: true });
+                        setRefreshing(null);
+                      }}
+                      disabled={refreshing === c.id}
+                      aria-label={`Refresh ${c.name}`}
+                      title={feedTitle(feed.url, feed.lastFetchedAt)}
+                      className={
+                        'text-ink-faint transition hover:text-ink ' +
+                        (refreshing === c.id ? 'animate-spin' : 'opacity-0 group-hover:opacity-100')
+                      }
+                    >
+                      <Refresh className="h-3 w-3" />
+                    </button>
+                  )}
+                  {calendars.length > 1 && (
+                    <button
+                      onClick={() => {
+                        const prompt = feed
+                          ? `Stop subscribing to "${c.name}"?`
+                          : `Delete "${c.name}" and all of its events?`;
+                        if (confirm(prompt)) removeCalendar(c.id);
+                      }}
+                      aria-label={feed ? `Unsubscribe from ${c.name}` : `Delete ${c.name}`}
+                      className="opacity-0 transition group-hover:opacity-100 text-ink-faint hover:text-red-600"
+                    >
+                      <span className="text-xs">×</span>
+                    </button>
+                  )}
+                </div>
+                {feed?.error && (
+                  <div className="mt-0.5 pl-[22px] text-[11px] leading-snug text-red-600 dark:text-red-400">
+                    {feed.error}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
 
         {adding ? (
@@ -167,12 +213,21 @@ export default function Sidebar({ open, onClose }: Props) {
             />
           </form>
         ) : (
-          <button
-            onClick={() => setAdding(true)}
-            className="mt-2 px-1 text-xs text-ink-faint hover:text-ink"
-          >
-            + Add calendar
-          </button>
+          <div className="mt-2 flex flex-col items-start gap-1">
+            <button
+              onClick={() => setAdding(true)}
+              className="px-1 text-xs text-ink-faint hover:text-ink"
+            >
+              + Add calendar
+            </button>
+            <button
+              onClick={() => setSubscribing(true)}
+              className="flex items-center gap-1 px-1 text-xs text-ink-faint hover:text-ink"
+            >
+              <Link className="h-3 w-3" />
+              Add by link
+            </button>
+          </div>
         )}
       </div>
 
@@ -184,6 +239,13 @@ export default function Sidebar({ open, onClose }: Props) {
         <div><kbd>C</kbd> chat · <kbd>/</kbd> search</div>
       </div>
       </aside>
+
+      {subscribing && <SubscribeDialog onClose={() => setSubscribing(false)} />}
     </>
   );
+}
+
+function feedTitle(url: string, lastFetchedAt: string | null): string {
+  const when = lastFetchedAt ? format(parse(lastFetchedAt), "MMM d 'at' h:mm a") : 'never';
+  return `${url}\nLast updated ${when}. Click to refresh now.`;
 }

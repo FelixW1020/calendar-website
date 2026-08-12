@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CalendarEvent } from '../types';
-import { calendarColor, useStore, type NewEvent } from '../store';
-import { format, parse, toLocalISO } from '../lib/dates';
-import { isSeriesEvent, masterOf, resolveEvent, type SeriesScope } from '../lib/recurrence';
-import { Close, Trash } from './Icons';
+import { calendarColor, useAllEvents, useStore, type NewEvent } from '../store';
+import { format, formatEventTime, parse, toLocalISO } from '../lib/dates';
+import { describeEvent, isSeriesEvent, masterOf, resolveEvent, type SeriesScope } from '../lib/recurrence';
+import { Close, Link, Trash } from './Icons';
 import LocationField from './LocationField';
 import RecurrenceField from './RecurrenceField';
 import ScopeDialog from './ScopeDialog';
@@ -70,7 +70,9 @@ function initialDraft(
 }
 
 export default function EventEditor() {
-  const events = useStore((s) => s.events);
+  // Subscribed feeds are included so their events can be opened and read; the
+  // dialog switches to a read-only card for them rather than an editor.
+  const events = useAllEvents();
   const selectedId = useStore((s) => s.selectedEventId);
   const calendars = useStore((s) => s.calendars);
   const updateEvent = useStore((s) => s.updateEvent);
@@ -165,6 +167,7 @@ export default function EventEditor() {
   }, [select]);
 
   if (!event) return null;
+  if (event.readOnly) return <SubscribedEvent event={event} onClose={() => select(null)} />;
 
   const changes = series ? changesOf(baseline, draft) : {};
   const ruleChanged = Object.prototype.hasOwnProperty.call(changes, 'recurrence');
@@ -356,6 +359,73 @@ export default function EventEditor() {
           onCancel={() => setConfirmDelete(false)}
         />
       )}
+    </>
+  );
+}
+
+/**
+ * An event from a subscribed calendar. There is nothing to edit and nothing to
+ * save, so this shows what the publisher said and says where it came from —
+ * which is also the answer to "why can't I change this?".
+ */
+function SubscribedEvent({ event, onClose }: { event: CalendarEvent; onClose: () => void }) {
+  const calendars = useStore((s) => s.calendars);
+  const calendar = calendars.find((c) => c.id === event.calendarId);
+  const repeats = describeEvent(event);
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/20 dark:bg-black/50" onClick={onClose} />
+      <div
+        role="dialog"
+        aria-label={event.title}
+        className="fixed left-1/2 top-1/2 z-50 max-h-[calc(100dvh-2rem)] w-[min(26rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-line bg-panel shadow-2xl"
+      >
+        <div className="flex items-start gap-2 border-b border-line p-3">
+          <span
+            className="event-chip mt-1.5 h-3 w-3 shrink-0 rounded-full"
+            style={{ background: calendarColor(calendars, event.calendarId) }}
+          />
+          <h2 className="min-w-0 flex-1 text-base font-medium text-ink">{event.title}</h2>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded p-1 text-ink-faint hover:bg-black/5 hover:text-ink dark:hover:bg-white/5"
+          >
+            <Close />
+          </button>
+        </div>
+
+        <div className="space-y-3 p-3 text-sm">
+          <div className="text-ink">
+            {format(parse(event.start), 'EEEE, MMMM d, yyyy')}
+            <div className="text-ink-soft">{formatEventTime(event)}</div>
+            {repeats && <div className="text-ink-faint">{repeats}</div>}
+          </div>
+
+          {event.location && (
+            <div>
+              <div className="mb-0.5 text-[11px] uppercase tracking-wider text-ink-faint">Where</div>
+              <div className="text-ink-soft">{event.location}</div>
+            </div>
+          )}
+
+          {event.description && (
+            <div>
+              <div className="mb-0.5 text-[11px] uppercase tracking-wider text-ink-faint">Notes</div>
+              <div className="whitespace-pre-wrap break-words text-ink-soft">{event.description}</div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 border-t border-line p-3 text-[12px] text-ink-faint">
+          <Link className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            From <span className="text-ink-soft">{calendar?.name ?? 'a subscribed calendar'}</span>,
+            which is read here by link. Changes have to be made where it is published.
+          </span>
+        </div>
+      </div>
     </>
   );
 }

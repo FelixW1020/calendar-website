@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CalendarEvent, ChatImage, ChatMessage } from '../types';
-import { diffEvents, isEmptyRestore, useStore, uid } from '../store';
+import { allEvents, diffEvents, isEmptyRestore, useStore, uid } from '../store';
 import { parse } from '../lib/dates';
 import { AssistantError, resetConversation, sendToAssistant } from '../lib/assistant';
 import { MAX_IMAGES, dataUrl, isImageFile, readImage } from '../lib/images';
@@ -107,7 +107,9 @@ export default function ChatPanel({ inputRef, onOpenSettings, open, onClose }: P
       const reply = await sendToAssistant(
         content,
         {
-          getEvents: () => useStore.getState().events,
+          // Subscribed feeds included: the assistant should see the holiday it
+          // is about to book over. Changing one is refused by the tools.
+          getEvents: () => allEvents(),
           getCalendars: () => useStore.getState().calendars,
           createEvent: (e) => useStore.getState().createEvent(e),
           updateEvent: (id, patch, scope) => useStore.getState().updateEventScoped(id, patch, scope),
